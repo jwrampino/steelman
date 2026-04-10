@@ -1,0 +1,42 @@
+[
+  {
+    "id": "692e0ff2-86f3-4086-a8fe-12e4390c283b",
+    "text": "Cities should reduce car dependency rather than simply 'ban cars.' Transportation is a major source of urban emissions, and policies like congestion pricing, protected bike lanes, and frequent public transit have reduced pollution in comparable cities without eliminating mobility.",
+    "topic": "urban policy",
+    "reward_sum": 4.0,
+    "reward_count": 5,
+    "avg_reward": 0.8,
+    "iterations_to_convergence": 2,
+    "convinced_reason": "Specific, evidence-based, and less absolutist."
+  },
+  {
+    "id": "2938c012-b31a-4923-8895-1f3bbce263ad",
+    "text": "A persuasive argument is usually stronger when it anticipates the strongest objection. Instead of asserting that opponents are ignorant, explain why a reasonable person might disagree and then respond directly to that concern.",
+    "topic": "rhetoric",
+    "reward_sum": 5.0,
+    "reward_count": 5,
+    "avg_reward": 1.0,
+    "iterations_to_convergence": 1,
+    "convinced_reason": "Balanced tone and strong counterargument handling."
+  },
+  {
+    "id": "12a51012-6e3a-4937-9b3e-e5ea2f63105d",
+    "text": "If the goal is persuasion rather than self-expression, claims should be narrowed to what can actually be defended. Replace sweeping statements with precise claims, concrete evidence, and one clearly stated mechanism.",
+    "topic": "argumentation",
+    "reward_sum": 4.0,
+    "reward_count": 4,
+    "avg_reward": 1.0,
+    "iterations_to_convergence": 1,
+    "convinced_reason": "More defensible and easier to follow."
+  },
+  {
+    "id": "de9b0d55-e860-46de-935f-c6867f34cd00",
+    "text": "Arguments often fail because they overreach. A narrower claim that admits limits can be more persuasive than a maximal claim that invites easy rebuttal.",
+    "topic": "argumentation",
+    "reward_sum": 3.0,
+    "reward_count": 4,
+    "avg_reward": 0.75,
+    "iterations_to_convergence": 2,
+    "convinced_reason": "Measured tone felt more credible."
+  }
+]
