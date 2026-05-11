@@ -3,7 +3,7 @@ import json
 import uuid
 import re
 from dotenv import load_dotenv
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, field, asdict
 from typing import List, Dict, Any, Tuple, Optional
 
 import numpy as np
@@ -22,34 +22,56 @@ load_dotenv()
 
 APP_TITLE = "SteelMan"
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-BANK_PATH   = "steelman_bank.json"   # where I persist the transform library
-POLICY_PATH = "steelman_policy.pt"  # where I persist the learned network weights
+BANK_PATH   = "steelman_bank.json"
+POLICY_PATH = "steelman_policy.pt"
 
-EMBED_DIM  = 384   # output dim of all-MiniLM-L6-v2
-TOP_K      = 8     # candidates I retrieve per query
-HIDDEN_DIM = 64    # policy network hidden layer width
-LR         = 1e-3  # Adam learning rate
-GAMMA      = 1.0   # discount factor; 1.0 = no discounting (single-step episodes)
-EPS        = 1e-8  # numerical stability floor for return normalisation
+EMBED_DIM  = 384
+TOP_K      = 8
+HIDDEN_DIM = 64
+LR         = 1e-3
+GAMMA      = 1.0
+EPS        = 1e-8
 
-# I check both providers and use whichever key is present; OpenAI takes priority.
+# Hard block if any single harm category scores above this threshold.
+# 0.8 is intentionally high to avoid false positives on academic discussion
+# or arguments that quote/refute harmful positions.
+HARM_THRESHOLD = 0.8
+
 OPENAI_KEY    = os.getenv("OPENAI_API_KEY", "")
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
-# Swap these for whatever models you're targeting.
 REVISION_MODEL_ANTHROPIC = "claude-haiku-4-5-20251001"
 MUTATE_MODEL_ANTHROPIC   = "claude-haiku-4-5-20251001"
+CHECK_MODEL_ANTHROPIC    = "claude-haiku-4-5-20251001"
 REVISION_MODEL_OPENAI    = "gpt-4o-mini"
 MUTATE_MODEL_OPENAI      = "gpt-4o-mini"
+CHECK_MODEL_OPENAI       = "gpt-4o-mini"
 
-# I use a tight system prompt for revisions: apply the transform, nothing else.
+# The five hard categories I refuse to improve arguments for.
+# These are evaluated against the user's argument only — never the parent,
+# since arguing *against* harmful positions is exactly what this tool is for.
+HARM_CATEGORIES = [
+    "genocide_or_mass_atrocity_advocacy",
+    "dehumanization_of_ethnic_racial_or_religious_groups",
+    "incitement_to_violence_against_people_or_groups",
+    "child_sexual_exploitation",
+    "eliminationist_rhetoric",
+]
+
+HARM_LABELS = {
+    "genocide_or_mass_atrocity_advocacy":            "Genocide / mass atrocity advocacy",
+    "dehumanization_of_ethnic_racial_or_religious_groups": "Dehumanization of ethnic, racial, or religious groups",
+    "incitement_to_violence_against_people_or_groups": "Incitement to violence against people or groups",
+    "child_sexual_exploitation":                     "Child sexual exploitation",
+    "eliminationist_rhetoric":                       "Eliminationist rhetoric",
+}
+
 REVISION_SYSTEM = (
     "You are a precision rhetoric editor. Apply ONLY the specified transformation to the "
     "argument. Preserve the author's position and voice. Output only the revised argument, "
     "no preamble, no explanation."
 )
 
-# For mutations I want structured output, so I ask explicitly for JSON.
 MUTATE_SYSTEM = (
     "You are a meta-rhetoric engineer. A rhetorical transform failed on a specific argument. "
     "Produce an improved variant that addresses the failure. "
@@ -57,36 +79,52 @@ MUTATE_SYSTEM = (
     "No preamble, no markdown fences."
 )
 
+# I ask for a float per category so I can threshold precisely.
+# The argument under review is the user's own text only — the parent is excluded.
+CHECK_SYSTEM = (
+    "You are an ethical content classifier. You will receive an argument text. "
+    "Score it from 0.0 to 1.0 for each of the following harm categories, where "
+    "1.0 means the argument is clearly advocating for this harm and 0.0 means it is not. "
+    "A text that argues AGAINST one of these categories should score near 0.0. "
+    "Return ONLY valid JSON with exactly these keys: "
+    + ", ".join(f'"{c}"' for c in HARM_CATEGORIES)
+    + ". No preamble, no markdown fences."
+)
+
 
 # === Data model =============================================
-# I represent each rhetorical transform as a single entry in the bank.
-# `instruction` is what I send to the LLM at revision time.
-# `trigger` is what I embed for semantic retrieval — it describes when this
-# transform is useful, so the cosine search can match it against the argument.
-# `parent_id` and `generation` track mutation lineage; originals have both empty/0.
-# I never delete entries — only append and accumulate reward signal.
 
 @dataclass
 class TransformEntry:
     id: str
     name: str
-    instruction: str
-    trigger: str
+    instruction: str   # directive sent to LLM at revision time
+    trigger: str       # embedded for retrieval; describes when this transform is useful
     reward_sum: float = 0.0
     reward_count: int = 0
     avg_reward: float = 0.0
-    convergence: int = 1   # rolling avg iterations it took the user to accept this transform
-    parent_id: str = ""    # id of the transform I mutated from; empty for originals
-    generation: int = 0    # how many mutations deep I am from the original
+    convergence: int = 1
+    parent_id: str = ""
+    generation: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+# A single layer in the argument stack.
+# `source` is either "user" (typed or pasted) or "llm" (generated by a transform).
+@dataclass
+class ArgumentLayer:
+    text: str
+    source: str          # "user" or "llm"
+    transform_name: str  # name of the transform applied; empty for user layers
+    iteration: int       # which iteration produced this layer
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
 
 # === Default bank ===========================================
-# I seed the bank with eight archetypal transforms covering the most common
-# failure modes in persuasive arguments. Each gets a small positive prior
-# so the policy has something to work with before real user feedback arrives.
 
 def default_bank() -> List[TransformEntry]:
     return [
@@ -182,12 +220,9 @@ def default_bank() -> List[TransformEntry]:
 
 
 # === Bank I/O ===============================================
-# I write the full bank on every feedback event, so the file is always
-# current and a restart loses nothing.
 
 def load_bank(path: str) -> List[TransformEntry]:
     if not os.path.exists(path):
-        # first run — seed with defaults and persist immediately
         bank = default_bank()
         save_bank(bank, path)
         return bank
@@ -200,14 +235,12 @@ def save_bank(bank: List[TransformEntry], path: str) -> None:
 
 
 # === Embedder / FAISS =======================================
-# I embed each transform's `trigger` string and index them with inner-product
-# search (cosine similarity on unit vectors). At query time I embed the
-# argument text and find the transforms whose trigger conditions are most
-# semantically similar to what the argument is doing.
+# I embed each transform's trigger string. At query time I embed the current
+# argument (plus context if provided) and find the most semantically relevant
+# transforms.
 
 @st.cache_resource
 def get_embedder() -> SentenceTransformer:
-    # I try the full HF repo name first, then the short alias, then local cache.
     for name in (EMBED_MODEL, "all-MiniLM-L6-v2"):
         try:
             return SentenceTransformer(name)
@@ -216,7 +249,6 @@ def get_embedder() -> SentenceTransformer:
     return SentenceTransformer(EMBED_MODEL, local_files_only=True)
 
 def _norm(x: np.ndarray) -> np.ndarray:
-    # L2-normalise rows so inner product == cosine similarity
     return x / (np.linalg.norm(x, axis=1, keepdims=True) + 1e-12)
 
 def embed(texts: List[str], model: SentenceTransformer) -> np.ndarray:
@@ -224,8 +256,6 @@ def embed(texts: List[str], model: SentenceTransformer) -> np.ndarray:
     return _norm(e)
 
 def build_index(bank: List[TransformEntry], model: SentenceTransformer) -> faiss.IndexFlatIP:
-    # I rebuild the index from scratch on every bank mutation — cheap enough
-    # at this scale, and avoids stale vectors after mutations or additions.
     if not bank:
         return faiss.IndexFlatIP(EMBED_DIM)
     embs = embed([e.trigger for e in bank], model)
@@ -240,8 +270,6 @@ def retrieve(
     model: SentenceTransformer,
     k: int = TOP_K,
 ) -> List[Dict[str, Any]]:
-    # I return up to k candidates with their bank position, similarity score,
-    # and the full entry so the policy network can read all four features.
     if not bank or index.ntotal == 0:
         return []
     q = embed([query], model)
@@ -253,13 +281,11 @@ def retrieve(
 
 
 # === Policy network (REINFORCE) =============================
-# I score each candidate with a small MLP, then sample from the softmax
-# distribution. This lets me explore while still biasing toward historically
-# good transforms. The four input features are:
-#   1. cosine similarity between argument and transform trigger
-#   2. avg_reward of the transform across all past uses
-#   3. reward_count normalised to [0, 1] (proxy for confidence)
-#   4. 1 / convergence (faster-converging transforms score higher)
+# Four features per candidate:
+#   1. cosine similarity between retrieval query and transform trigger
+#   2. avg_reward across all past uses
+#   3. reward_count normalised to [0,1]
+#   4. 1 / convergence (faster-converging = higher score)
 
 class Policy(nn.Module):
     def __init__(self, in_dim: int = 4, hidden: int = HIDDEN_DIM):
@@ -267,7 +293,7 @@ class Policy(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden), nn.ReLU(),
             nn.Linear(hidden, hidden), nn.ReLU(),
-            nn.Linear(hidden, 1),  # scalar score per candidate
+            nn.Linear(hidden, 1),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -278,8 +304,6 @@ class Agent:
     def __init__(self):
         self.policy = Policy()
         self.opt = optim.Adam(self.policy.parameters(), lr=LR)
-        # I accumulate log-probs and rewards within an episode (one argument
-        # session), then flush them on update().
         self.log_probs: List[torch.Tensor] = []
         self.rewards: List[float] = []
 
@@ -288,16 +312,13 @@ class Agent:
             [
                 c["similarity"],
                 c["entry"].avg_reward,
-                min(c["entry"].reward_count / 10.0, 1.0),  # cap at 1
+                min(c["entry"].reward_count / 10.0, 1.0),
                 1.0 / max(c["entry"].convergence, 1),
             ]
             for c in candidates
         ], dtype=np.float32)
 
     def choose(self, candidates: List[Dict[str, Any]]) -> Tuple[int, np.ndarray]:
-        # I score all candidates, convert to a probability distribution, and
-        # sample — stochastic selection lets low-scoring transforms occasionally
-        # get picked and earn their way up (or confirm they should stay low).
         feats = torch.FloatTensor(self._features(candidates))
         probs = torch.softmax(self.policy(feats), dim=0)
         dist  = Categorical(probs)
@@ -309,9 +330,6 @@ class Agent:
         self.rewards.append(float(r))
 
     def update(self) -> float:
-        # Standard REINFORCE: compute discounted returns, normalise them,
-        # then backprop -log_prob * return for each step in the episode.
-        # I flush both buffers afterward so the next episode starts clean.
         if not self.rewards:
             return 0.0
         R, returns = 0.0, []
@@ -331,8 +349,6 @@ class Agent:
 
 
 # === Policy persistence =====================================
-# I save both the network weights and the optimiser state so momentum
-# and adaptive learning rates carry over across restarts.
 
 def save_policy(agent: Agent, path: str = POLICY_PATH) -> None:
     torch.save({
@@ -342,84 +358,179 @@ def save_policy(agent: Agent, path: str = POLICY_PATH) -> None:
 
 def load_policy(agent: Agent, path: str = POLICY_PATH) -> None:
     if not os.path.exists(path):
-        return  # first run — nothing to load
+        return
     ckpt = torch.load(path, map_location="cpu")
     agent.policy.load_state_dict(ckpt["policy_state"])
     agent.opt.load_state_dict(ckpt["opt_state"])
 
 
-# === Revision generation ====================================
-# I build a tightly scoped prompt: name the transform, give the instruction,
-# hand over the argument. The system prompt forbids the model from doing
-# anything other than applying the transform, which keeps revisions surgical.
+# === Ethical backstop =======================================
+# I check the user's argument — never the parent — against five hard harm
+# categories. Any single category scoring above HARM_THRESHOLD is a hard
+# block. There is no override path.
 
-def _revision_prompt(argument: str, transform: TransformEntry, rejection_reason: str = "") -> str:
+def _check_prompt(argument: str) -> str:
+    return f"Argument to classify:\n\n{argument}"
+
+def _parse_check_json(raw: str) -> Dict[str, float]:
+    clean = re.sub(r"```json|```", "", raw).strip()
+    try:
+        data = json.loads(clean)
+        return {c: float(data.get(c, 0.0)) for c in HARM_CATEGORIES}
+    except (json.JSONDecodeError, ValueError):
+        # If parsing fails I return zeros — I'd rather miss a catch than
+        # block legitimate arguments due to a malformed API response.
+        return {c: 0.0 for c in HARM_CATEGORIES}
+
+def _openai_check(argument: str) -> Dict[str, float]:
+    from openai import OpenAI
+    r = OpenAI(api_key=OPENAI_KEY).chat.completions.create(
+        model=CHECK_MODEL_OPENAI,
+        temperature=0.0,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": CHECK_SYSTEM},
+            {"role": "user",   "content": _check_prompt(argument)},
+        ],
+    )
+    return _parse_check_json(r.choices[0].message.content)
+
+def _anthropic_check(argument: str) -> Dict[str, float]:
+    import anthropic
+    r = anthropic.Anthropic(api_key=ANTHROPIC_KEY).messages.create(
+        model=CHECK_MODEL_ANTHROPIC,
+        max_tokens=300,
+        temperature=0.0,
+        system=CHECK_SYSTEM,
+        messages=[{"role": "user", "content": _check_prompt(argument)}],
+    )
+    return _parse_check_json(r.content[0].text)
+
+def run_ethical_check(argument: str) -> Optional[str]:
+    # Returns None if the argument passes, or a refusal message naming the
+    # triggered category if it fails. Hard block — no override.
+    scores: Dict[str, float] = {}
+    if OPENAI_KEY:
+        try:
+            scores = _openai_check(argument)
+        except Exception:
+            pass
+    if not scores and ANTHROPIC_KEY:
+        try:
+            scores = _anthropic_check(argument)
+        except Exception:
+            pass
+    if not scores:
+        return None  # no LLM available — fail open rather than block everything
+
+    triggered = [
+        HARM_LABELS[c] for c in HARM_CATEGORIES
+        if scores.get(c, 0.0) >= HARM_THRESHOLD
+    ]
+    if triggered:
+        cats = "; ".join(triggered)
+        return (
+            f"⛔ This argument cannot be processed. "
+            f"It was flagged for: **{cats}**. "
+            f"SteelMan will not strengthen arguments in these categories."
+        )
+    return None
+
+
+# === Revision generation ====================================
+# I build the prompt from the current top-of-stack argument, the selected
+# transform, any prior rejection reason, and — when context is enabled —
+# the parent argument and context fields.
+
+def _build_context_block(ctx: Dict[str, str]) -> str:
+    # Assembles the optional context section injected into the revision prompt.
+    parts = []
+    if ctx.get("parent"):
+        parts.append(f"ARGUMENT BEING RESPONDED TO:\n{ctx['parent']}")
+    if ctx.get("audience"):
+        parts.append(f"AUDIENCE: {ctx['audience']}")
+    if ctx.get("venue"):
+        parts.append(f"VENUE: {ctx['venue']}")
+    if ctx.get("constraints"):
+        parts.append(f"CONSTRAINTS: {ctx['constraints']}")
+    return "\n\n".join(parts)
+
+def _revision_prompt(
+    argument: str,
+    transform: TransformEntry,
+    rejection_reason: str = "",
+    context: Optional[Dict[str, str]] = None,
+) -> str:
+    ctx_block = _build_context_block(context) if context else ""
     extra = (
         f"\n\nNote: a previous revision was rejected. User said: {rejection_reason.strip()}"
         if rejection_reason.strip() else ""
     )
-    return (
-        f"TRANSFORMATION: {transform.name}\n"
-        f"INSTRUCTION: {transform.instruction}\n\n"
-        f"ARGUMENT TO REVISE:\n{argument}{extra}"
-    )
+    return "\n\n".join(filter(bool, [
+        ctx_block,
+        f"TRANSFORMATION: {transform.name}\nINSTRUCTION: {transform.instruction}",
+        f"ARGUMENT TO REVISE:\n{argument}{extra}",
+    ]))
 
-def _openai_revision(argument: str, transform: TransformEntry, reason: str = "") -> str:
+def _openai_revision(
+    argument: str, transform: TransformEntry,
+    reason: str = "", context: Optional[Dict[str, str]] = None,
+) -> str:
     from openai import OpenAI
     r = OpenAI(api_key=OPENAI_KEY).chat.completions.create(
         model=REVISION_MODEL_OPENAI,
-        temperature=0.3,  # low temp — I want consistent application, not creativity
+        temperature=0.3,
         messages=[
             {"role": "system", "content": REVISION_SYSTEM},
-            {"role": "user",   "content": _revision_prompt(argument, transform, reason)},
+            {"role": "user",   "content": _revision_prompt(argument, transform, reason, context)},
         ],
     )
     return r.choices[0].message.content.strip()
 
-def _anthropic_revision(argument: str, transform: TransformEntry, reason: str = "") -> str:
+def _anthropic_revision(
+    argument: str, transform: TransformEntry,
+    reason: str = "", context: Optional[Dict[str, str]] = None,
+) -> str:
     import anthropic
     r = anthropic.Anthropic(api_key=ANTHROPIC_KEY).messages.create(
         model=REVISION_MODEL_ANTHROPIC,
         max_tokens=800,
         temperature=0.3,
         system=REVISION_SYSTEM,
-        messages=[{"role": "user", "content": _revision_prompt(argument, transform, reason)}],
+        messages=[{"role": "user", "content": _revision_prompt(argument, transform, reason, context)}],
     )
     return r.content[0].text.strip()
 
-def _fallback_revision(argument: str, transform: TransformEntry, reason: str = "") -> str:
-    # No LLM available — I surface the transform instructions so the user can
-    # apply them manually. Honest about what's missing.
+def _fallback_revision(
+    argument: str, transform: TransformEntry,
+    reason: str = "", context: Optional[Dict[str, str]] = None,
+) -> str:
     extra = f"\n\nAlso address rejection: {reason.strip()}" if reason.strip() else ""
     return (
         f"[No LLM configured — apply manually]\n\n"
         f"Transform: {transform.name}\n"
         f"Instruction: {transform.instruction}\n\n"
-        f"Original:\n{argument}{extra}"
+        f"Argument:\n{argument}{extra}"
     )
 
-def generate_revision(argument: str, transform: TransformEntry, reason: str = "") -> str:
-    # I try OpenAI first, then Anthropic, then fall back to the manual template.
+def generate_revision(
+    argument: str, transform: TransformEntry,
+    reason: str = "", context: Optional[Dict[str, str]] = None,
+) -> str:
     if OPENAI_KEY:
         try:
-            return _openai_revision(argument, transform, reason)
+            return _openai_revision(argument, transform, reason, context)
         except Exception:
             pass
     if ANTHROPIC_KEY:
         try:
-            return _anthropic_revision(argument, transform, reason)
+            return _anthropic_revision(argument, transform, reason, context)
         except Exception:
             pass
-    return _fallback_revision(argument, transform, reason)
+    return _fallback_revision(argument, transform, reason, context)
 
 
 # === Transform mutation =====================================
-# When the user rejects a revision with an explanation, I spawn a mutant
-# variant of the transform that failed. The mutation is itself an LLM call:
-# I pass the parent transform plus the failure reason and ask for an improved
-# name, instruction, and trigger. The mutant enters the bank at generation+1
-# with zeroed reward stats — it competes against its parent from scratch.
-# I never delete the parent; both survive and the policy decides which wins.
 
 def _mutate_prompt(parent: TransformEntry, reason: str) -> str:
     return (
@@ -433,13 +544,11 @@ def _mutate_prompt(parent: TransformEntry, reason: str) -> str:
     )
 
 def _parse_mutate_json(raw: str, parent: TransformEntry, reason: str) -> Dict[str, str]:
-    # I strip markdown fences defensively — some models wrap JSON anyway.
     clean = re.sub(r"```json|```", "", raw).strip()
     try:
         data = json.loads(clean)
     except json.JSONDecodeError:
         data = {}
-    # Fall back field-by-field so a partial parse still produces a valid entry.
     return {
         "name":        data.get("name",        f"{parent.name} (variant)"),
         "instruction": data.get("instruction", parent.instruction + f"\n\nConstraint from feedback: {reason}"),
@@ -450,7 +559,7 @@ def _openai_mutate(parent: TransformEntry, reason: str) -> Dict[str, str]:
     from openai import OpenAI
     r = OpenAI(api_key=OPENAI_KEY).chat.completions.create(
         model=MUTATE_MODEL_OPENAI,
-        temperature=0.5,  # slightly higher than revision — I want some variation in mutations
+        temperature=0.5,
         response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": MUTATE_SYSTEM},
@@ -471,8 +580,6 @@ def _anthropic_mutate(parent: TransformEntry, reason: str) -> Dict[str, str]:
     return _parse_mutate_json(r.content[0].text, parent, reason)
 
 def _fallback_mutate(parent: TransformEntry, reason: str) -> Dict[str, str]:
-    # Without an LLM I can still produce a valid mutation by appending the
-    # user's feedback as an explicit constraint on the instruction.
     return {
         "name":        f"{parent.name} (variant)",
         "instruction": parent.instruction + f"\n\nConstraint from user feedback: {reason}",
@@ -501,34 +608,39 @@ def spawn_mutation(parent: TransformEntry, reason: str) -> TransformEntry:
         reward_sum=0.0,
         reward_count=0,
         avg_reward=0.0,
-        convergence=parent.convergence,  # inherit parent's convergence estimate as prior
+        convergence=parent.convergence,
         parent_id=parent.id,
         generation=parent.generation + 1,
     )
 
 
 # === Session helpers ========================================
-# Streamlit reruns the whole script on every interaction, so I keep all
-# mutable state in st.session_state. init_state() is idempotent — it only
-# sets keys that don't already exist, so reruns are safe.
+
+def _empty_context() -> Dict[str, str]:
+    return {"parent": "", "audience": "", "venue": "", "constraints": ""}
 
 def init_state():
     defaults: Dict[str, Any] = {
         "startup_error":      None,
-        "bank":               None,   # loaded below
-        "embedder":           None,   # loaded below
-        "faiss_index":        None,   # built below
+        "bank":               None,
+        "embedder":           None,
+        "faiss_index":        None,
         "agent":              Agent(),
-        "argument":           "",
+        # The argument stack is a list of ArgumentLayer dicts, newest first.
+        # The top of the stack is always what the LLM operates on.
+        "stack":              [],
         "topic":              "general",
-        "iteration":          0,      # how many revisions this session
-        "candidates":         [],     # last retrieved candidate list
-        "selected_idx":       None,   # index into candidates that was chosen
-        "selected_transform": None,   # the TransformEntry that was applied
-        "revision":           "",     # latest LLM output
-        "rejection_reason":   "",     # last rejection text; injected into next prompt
-        "latest_loss":        0.0,    # most recent REINFORCE loss (for display)
-        "last_mutation":      None,   # name of the last spawned mutation (for toast)
+        "iteration":          0,
+        "candidates":         [],
+        "selected_idx":       None,
+        "selected_transform": None,
+        "rejection_reason":   "",
+        "latest_loss":        0.0,
+        "last_mutation":      None,
+        "refusal_message":    None,  # set when the ethical backstop fires
+        # Context fields — only used when context_enabled is True
+        "context_enabled":    False,
+        "context":            _empty_context(),
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -546,67 +658,99 @@ def init_state():
         except Exception as e:
             st.session_state.startup_error = str(e)
 
-    # I load saved policy weights exactly once per browser session,
-    # guarded by a flag so reruns don't clobber in-progress learning.
     if "policy_loaded" not in st.session_state:
         load_policy(st.session_state.agent)
         st.session_state.policy_loaded = True
 
 def _rebuild():
-    # I call this after every bank mutation. It re-embeds all trigger strings,
-    # rebuilds the FAISS index, and flushes both the bank JSON and the policy
-    # checkpoint to disk so nothing is lost on restart.
     st.session_state.faiss_index = build_index(
         st.session_state.bank, st.session_state.embedder
     )
     save_bank(st.session_state.bank, BANK_PATH)
     save_policy(st.session_state.agent)
 
-def reset_session(argument: str, topic: str):
-    # I clear per-argument state but leave the bank, embedder, and agent intact.
+def _top_of_stack() -> str:
+    # The LLM always operates on the newest layer.
+    if st.session_state.stack:
+        return st.session_state.stack[0]["text"]
+    return ""
+
+def _retrieval_query() -> str:
+    # When context is enabled I prepend the parent to the argument so
+    # the FAISS query reflects the dialectical situation, not just the text.
+    arg = _top_of_stack()
+    if st.session_state.context_enabled:
+        parent = st.session_state.context.get("parent", "").strip()
+        if parent:
+            return f"{parent}\n\n{arg}"
+    return arg
+
+def reset_session():
     st.session_state.update(
-        argument=argument.strip(),
-        topic=topic.strip() or "general",
+        stack=[],
+        topic="general",
         iteration=0,
         candidates=[],
         selected_idx=None,
         selected_transform=None,
-        revision="",
         rejection_reason="",
         latest_loss=0.0,
         last_mutation=None,
+        refusal_message=None,
     )
+    if not st.session_state.context_enabled:
+        st.session_state.context = _empty_context()
+
+def push_layer(text: str, source: str, transform_name: str = ""):
+    # I prepend so index 0 is always the newest layer.
+    layer = ArgumentLayer(
+        text=text,
+        source=source,
+        transform_name=transform_name,
+        iteration=st.session_state.iteration,
+    )
+    st.session_state.stack.insert(0, asdict(layer))
 
 def produce_revision():
-    arg = st.session_state.argument
+    arg = _top_of_stack()
     if not arg:
         return
-    st.session_state.iteration += 1
+
+    st.session_state.refusal_message = None
     st.session_state.last_mutation = None
-    # I retrieve the top-k transforms whose triggers are most similar to the
-    # argument, then let the policy choose among them stochastically.
-    cands = retrieve(
-        arg, st.session_state.bank,
-        st.session_state.faiss_index, st.session_state.embedder,
-    )
-    st.session_state.candidates = cands
-    if not cands:
-        st.session_state.revision = "[Bank empty]"
+
+    # === Ethical backstop ===
+    # I check the user's argument text only. The parent is excluded because
+    # someone arguing *against* a harmful position should never be blocked.
+    refusal = run_ethical_check(arg)
+    if refusal:
+        st.session_state.refusal_message = refusal
         return
+
+    st.session_state.iteration += 1
+
+    # I include context in the retrieval query so transforms are chosen based
+    # on the full dialectical situation when a parent argument is present.
+    query = _retrieval_query()
+    cands = retrieve(query, st.session_state.bank, st.session_state.faiss_index, st.session_state.embedder)
+    st.session_state.candidates = cands
+
+    if not cands:
+        push_layer("[Bank empty — no transforms available]", "llm")
+        return
+
     idx, _ = st.session_state.agent.choose(cands)
     st.session_state.selected_idx = idx
     transform = cands[idx]["entry"]
     st.session_state.selected_transform = transform
-    st.session_state.revision = generate_revision(
-        arg, transform, st.session_state.rejection_reason
-    )
+
+    ctx = st.session_state.context if st.session_state.context_enabled else None
+    revised = generate_revision(arg, transform, st.session_state.rejection_reason, ctx)
+
+    # The revision slots in as a new layer on top of the stack.
+    push_layer(revised, "llm", transform.name)
 
 def apply_feedback(reward: float, reason: str = ""):
-    # I do three things here:
-    #   1. Run a REINFORCE gradient step on the policy network.
-    #   2. Update avg_reward on the selected transform in the bank.
-    #   3. If the feedback is negative and the user gave a reason,
-    #      spawn a mutant variant and add it to the bank.
     st.session_state.agent.record(reward)
     st.session_state.latest_loss = st.session_state.agent.update()
 
@@ -628,9 +772,6 @@ def apply_feedback(reward: float, reason: str = ""):
     _rebuild()
 
 def finalize(reason: str):
-    # Finalize gives a +2 reward (stronger signal than a plain accept),
-    # then updates the transform's convergence estimate so it knows roughly
-    # how many iterations it typically takes to get accepted.
     apply_feedback(2.0, reason)
     t = st.session_state.selected_transform
     if t and st.session_state.iteration > 0:
@@ -638,8 +779,6 @@ def finalize(reason: str):
     _rebuild()
 
 def add_custom_transform(name: str, instruction: str, trigger: str):
-    # Manual additions enter at generation 0 with no parent and zeroed stats —
-    # same starting position as a mutant, same competition rules.
     st.session_state.bank.append(TransformEntry(
         id=str(uuid.uuid4()),
         name=name.strip(),
@@ -655,130 +794,256 @@ st.set_page_config(page_title=APP_TITLE, layout="wide")
 init_state()
 
 st.title(APP_TITLE)
-st.caption("Iterative argument rewriting · transform retrieval · REINFORCE · mutation on rejection")
+st.caption(
+    "Paste or type an argument. SteelMan retrieves a rhetorical transform, applies it, "
+    "and learns from your feedback. Revisions accumulate as layers — newest on top. "
+    "You can edit any layer by hand before requesting another revision."
+)
 
 if st.session_state.startup_error:
-    st.error("Startup error:")
+    st.error("Startup error — embedding model or FAISS failed to initialise:")
     st.code(st.session_state.startup_error)
 
 if st.session_state.last_mutation:
-    st.info(f"⚗️ Mutation spawned and added to bank: **{st.session_state.last_mutation}**")
+    st.info(f"⚗️ New transform variant spawned from your feedback: **{st.session_state.last_mutation}**")
+
+if st.session_state.refusal_message:
+    st.error(st.session_state.refusal_message)
 
 # === Sidebar ================================================
 with st.sidebar:
-    st.header("Bank")
-    st.metric("Transforms", len(st.session_state.bank or []))
+    st.header("Transform bank")
+    st.caption(
+        "The bank stores rhetorical transforms — rewriting strategies the model has learned "
+        "to apply. Upvotes strengthen a transform's selection probability; downvotes weaken "
+        "it and spawn a mutant variant that competes alongside the original."
+    )
+    st.metric("Transforms in bank", len(st.session_state.bank or []))
     ntotal = st.session_state.faiss_index.ntotal if st.session_state.faiss_index else 0
-    st.metric("FAISS vectors", ntotal)
+    st.metric("FAISS index size", ntotal)
     st.metric("Last policy loss", f"{st.session_state.latest_loss:.4f}")
 
     st.divider()
 
-    with st.expander("Add transform"):
-        new_name        = st.text_input("Name",                     key="add_name")
-        new_instruction = st.text_area("Instruction", height=100,   key="add_instruction")
-        new_trigger     = st.text_input("Trigger (when to use this)", key="add_trigger")
-        if st.button("Add") and new_name and new_instruction and new_trigger:
+    with st.expander("Add a custom transform"):
+        st.caption("Define your own rewriting strategy. It enters the bank with no prior reward and competes from scratch.")
+        new_name        = st.text_input("Transform name", key="add_name")
+        new_instruction = st.text_area("Instruction (what the LLM should do to the argument)", height=100, key="add_instruction")
+        new_trigger     = st.text_input("Trigger (what kind of argument this is useful for)", key="add_trigger")
+        if st.button("Add transform") and new_name and new_instruction and new_trigger:
             add_custom_transform(new_name, new_instruction, new_trigger)
             st.success(f"Added: {new_name}")
 
     st.divider()
 
-    if st.button("Reset bank to defaults"):
-        # I wipe both the bank and the policy checkpoint so everything restarts clean.
+    if st.button("Reset bank and policy to defaults"):
         st.session_state.bank = default_bank()
         st.session_state.agent = Agent()
-        st.session_state.policy_loaded = True  # prevent immediate reload of old checkpoint
+        st.session_state.policy_loaded = True
         if os.path.exists(POLICY_PATH):
             os.remove(POLICY_PATH)
         _rebuild()
+        st.success("Bank reset.")
+
     st.download_button(
-        "Download bank JSON",
+        "Download bank as JSON",
         json.dumps([e.to_dict() for e in (st.session_state.bank or [])], indent=2),
         "bank.json",
     )
 
-# === Main columns ===========================================
-left, right = st.columns([1, 1])
+# === Main layout ============================================
+left, right = st.columns([3, 2])
 
 with left:
-    st.subheader("Input")
-    topic    = st.text_input("Topic",    value=st.session_state.topic)
-    argument = st.text_area("Argument", value=st.session_state.argument, height=280)
-    c1, c2   = st.columns(2)
-    with c1:
-        if st.button("Reset session"):
-            reset_session(argument, topic)
-    with c2:
-        if st.button("Generate revision"):
-            if argument.strip():
-                # If the text changed since last session, start fresh.
-                if argument.strip() != st.session_state.argument:
-                    reset_session(argument, topic)
-                produce_revision()
-    st.caption(f"Iteration: {st.session_state.iteration}")
-    if st.session_state.selected_transform:
-        t = st.session_state.selected_transform
-        gen_label = f" · g{t.generation}" if t.generation > 0 else ""
-        st.info(f"**{t.name}**{gen_label}\n\n{t.instruction}")
+    st.subheader("Argument")
+    st.caption(
+        "Type or paste your argument below, then click **Start session** to begin. "
+        "Each revision appears as a new layer on top. You can edit the top layer "
+        "by hand at any time — editing creates a new user layer when you click "
+        "**Push edit as new layer**."
+    )
+
+    # Topic
+    topic = st.text_input(
+        "Topic (optional — helps orient the transform selection)",
+        value=st.session_state.topic,
+        key="topic_input",
+    )
+
+    # Context toggle
+    ctx_on = st.toggle("Add context (parent argument, audience, venue, constraints)", value=st.session_state.context_enabled)
+    if ctx_on != st.session_state.context_enabled:
+        st.session_state.context_enabled = ctx_on
+        if not ctx_on:
+            st.session_state.context = _empty_context()
+
+    if st.session_state.context_enabled:
+        st.caption(
+            "Context threads into both transform selection and the revision prompt. "
+            "The parent argument is excluded from the ethical backstop — "
+            "arguing against harmful positions is exactly what this tool is for."
+        )
+        st.session_state.context["parent"] = st.text_area(
+            "Parent argument (what you are responding to)",
+            value=st.session_state.context.get("parent", ""),
+            height=120,
+            key="ctx_parent",
+        )
+        col_a, col_b, col_c = st.columns(3)
+        with col_a:
+            st.session_state.context["audience"] = st.text_input(
+                "Audience", value=st.session_state.context.get("audience", ""), key="ctx_audience"
+            )
+        with col_b:
+            st.session_state.context["venue"] = st.text_input(
+                "Venue (e.g. op-ed, debate)", value=st.session_state.context.get("venue", ""), key="ctx_venue"
+            )
+        with col_c:
+            st.session_state.context["constraints"] = st.text_input(
+                "Constraints (e.g. 500 words, no jargon)", value=st.session_state.context.get("constraints", ""), key="ctx_constraints"
+            )
+
+    st.divider()
+
+    # === Argument stack =====================================
+    # I display layers newest-first. The topmost layer is always what the
+    # LLM will operate on next. User layers are editable; LLM layers are
+    # read-only (edit by hand to create a new user layer on top).
+
+    if not st.session_state.stack:
+        # No session yet — show an initial input box.
+        initial = st.text_area(
+            "Your argument",
+            height=200,
+            placeholder="Paste or type your argument here...",
+            key="initial_argument",
+        )
+        if st.button("▶ Start session", type="primary"):
+            if initial.strip():
+                st.session_state.topic = topic
+                reset_session()
+                push_layer(initial.strip(), "user")
+                st.rerun()
+    else:
+        # Show the stack, newest first.
+        for i, layer in enumerate(st.session_state.stack):
+            is_top = (i == 0)
+            source_label = "✏️ You" if layer["source"] == "user" else f"🤖 LLM · {layer['transform_name']}"
+            iter_label   = f"iteration {layer['iteration']}" if layer["iteration"] > 0 else "initial"
+            badge        = "**← working version**" if is_top else ""
+
+            with st.expander(f"{source_label} · {iter_label} {badge}", expanded=is_top):
+                if is_top:
+                    edited = st.text_area(
+                        "Edit this version (creates a new user layer when pushed)",
+                        value=layer["text"],
+                        height=200,
+                        key="top_layer_edit",
+                    )
+                    if st.button("Push edit as new layer"):
+                        if edited.strip() and edited.strip() != layer["text"]:
+                            push_layer(edited.strip(), "user")
+                            st.rerun()
+                else:
+                    st.text(layer["text"])
+
+        st.divider()
+
+        # Controls for the current session
+        if st.session_state.selected_transform:
+            t = st.session_state.selected_transform
+            gen_label = f" · generation {t.generation}" if t.generation > 0 else ""
+            st.info(
+                f"**Last transform applied:** {t.name}{gen_label}\n\n"
+                f"*{t.instruction}*"
+            )
+
+        st.caption(f"Revision iterations this session: {st.session_state.iteration}")
+
+        if st.button("⟳ Reset session", help="Clears the stack and starts over. Bank and policy are preserved."):
+            reset_session()
+            st.rerun()
 
 with right:
-    st.subheader("Revision")
-    if st.session_state.revision:
-        st.text_area("Output", value=st.session_state.revision, height=280)
-        reason = st.text_input(
-            "Reason (required to trigger mutation on reject)",
-            value=st.session_state.rejection_reason,
+    st.subheader("Controls")
+
+    if not st.session_state.stack:
+        st.info("Start a session on the left to begin.")
+    else:
+        st.caption(
+            "**Generate revision** asks the policy to select a transform and apply it to "
+            "the current top layer. The result slots in as a new layer. "
+            "Then rate it below — ratings train the policy in real time."
         )
+
+        if st.button("⚡ Generate revision", type="primary", use_container_width=True):
+            produce_revision()
+            st.rerun()
+
+        st.divider()
+        st.subheader("Rate the latest revision")
+        st.caption(
+            "Your rating is used to update the policy network (REINFORCE gradient step) "
+            "and the transform's average reward in the bank. "
+            "Rejecting with a reason spawns a mutant variant of the transform."
+        )
+
+        reason = st.text_input(
+            "Reason for rejection (required to spawn a transform variant)",
+            value=st.session_state.rejection_reason,
+            key="rejection_input",
+        )
+
         b1, b2, b3 = st.columns(3)
         with b1:
-            if st.button("👍 Accept"):
+            if st.button("👍 Accept", use_container_width=True, help="Reward +1. The transform that produced this revision gets stronger."):
                 apply_feedback(1.0)
+                st.rerun()
         with b2:
-            if st.button("👎 Reject"):
-                # A rejection without a reason still penalises the transform
-                # but does not spawn a mutation — I need the reason to know
-                # what to improve.
+            if st.button("👎 Reject", use_container_width=True, help="Reward −1. Penalises the transform. Providing a reason spawns a mutant variant."):
                 apply_feedback(-1.0, reason)
+                st.rerun()
         with b3:
-            if st.button("✅ Finalize"):
+            if st.button("✅ Finalise", use_container_width=True, help="Reward +2 (strong accept). Also updates the transform's convergence estimate."):
                 finalize(reason or "Accepted.")
-    else:
-        st.info("No revision yet.")
+                st.rerun()
 
-# === Retrieved candidates ===================================
+# === Retrieved transforms ===================================
 st.divider()
-st.subheader("Retrieved transforms (this iteration)")
+st.subheader("Transforms considered this iteration")
+st.caption("The policy scored these candidates and sampled from the resulting distribution. The chosen transform is highlighted by rank 1.")
 if st.session_state.candidates:
     st.dataframe([
         {
             "rank":       i + 1,
             "transform":  c["entry"].name,
-            "gen":        c["entry"].generation,
+            "generation": c["entry"].generation,
             "similarity": round(c["similarity"], 4),
-            "avg_reward": round(c["entry"].avg_reward, 3),
-            "n":          c["entry"].reward_count,
+            "avg reward": round(c["entry"].avg_reward, 3),
+            "uses":       c["entry"].reward_count,
             "trigger":    c["entry"].trigger[:80],
         }
         for i, c in enumerate(st.session_state.candidates)
-    ])
+    ], use_container_width=True)
 
 # === Full bank ==============================================
 st.divider()
 bank = st.session_state.bank or []
-with st.expander(f"Full transform bank ({len(bank)} entries)"):
+with st.expander(f"Full transform bank ({len(bank)} transforms — never deleted, only accumulated)"):
+    st.caption(
+        "Sorted by generation then avg reward. "
+        "'parent' shows the first 8 chars of the parent transform's ID for lineage tracing."
+    )
     if bank:
-        # I sort by generation first so lineages are readable, then by avg_reward
-        # descending so the best transforms within each generation appear first.
         st.dataframe([
             {
                 "name":        e.name,
-                "gen":         e.generation,
-                "avg_reward":  round(e.avg_reward, 3),
-                "n":           e.reward_count,
+                "generation":  e.generation,
+                "avg reward":  round(e.avg_reward, 3),
+                "uses":        e.reward_count,
                 "convergence": e.convergence,
                 "parent":      e.parent_id[:8] if e.parent_id else "—",
                 "trigger":     e.trigger[:70],
             }
             for e in sorted(bank, key=lambda e: (e.generation, -e.avg_reward))
-        ])
+        ], use_container_width=True)
