@@ -3,7 +3,7 @@ import json
 import uuid
 import re
 from dotenv import load_dotenv
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from typing import List, Dict, Any, Tuple, Optional
 
 import numpy as np
@@ -16,11 +16,10 @@ import torch.optim as optim
 from torch.distributions import Categorical
 
 # === Config =================================================
-# I keep all tuneable knobs here so nothing is buried in logic.
 
 load_dotenv()
 
-APP_TITLE = "SteelMan"
+APP_TITLE   = "SteelMan"
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 BANK_PATH   = "steelman_bank.json"
 POLICY_PATH = "steelman_policy.pt"
@@ -32,9 +31,9 @@ LR         = 1e-3
 GAMMA      = 1.0
 EPS        = 1e-8
 
-# Hard block if any single harm category scores above this threshold.
-# 0.8 is intentionally high to avoid false positives on academic discussion
-# or arguments that quote/refute harmful positions.
+# A single category scoring at or above this threshold is a hard block.
+# Set high (0.8) to avoid false positives on academic discussion, journalism,
+# or arguments that describe/refute a harmful position without advocating it.
 HARM_THRESHOLD = 0.8
 
 OPENAI_KEY    = os.getenv("OPENAI_API_KEY", "")
@@ -47,23 +46,27 @@ REVISION_MODEL_OPENAI    = "gpt-4o-mini"
 MUTATE_MODEL_OPENAI      = "gpt-4o-mini"
 CHECK_MODEL_OPENAI       = "gpt-4o-mini"
 
-# The five hard categories I refuse to improve arguments for.
-# These are evaluated against the user's argument only — never the parent,
-# since arguing *against* harmful positions is exactly what this tool is for.
+# Seven hard categories. Evaluated against the user's argument text only —
+# never the parent, since arguing *against* these positions is a legitimate
+# and often important use of this tool.
 HARM_CATEGORIES = [
     "genocide_or_mass_atrocity_advocacy",
     "dehumanization_of_ethnic_racial_or_religious_groups",
     "incitement_to_violence_against_people_or_groups",
     "child_sexual_exploitation",
     "eliminationist_rhetoric",
+    "scam_or_fraud_facilitation",
+    "self_harm_or_suicide_advocacy",
 ]
 
 HARM_LABELS = {
-    "genocide_or_mass_atrocity_advocacy":            "Genocide / mass atrocity advocacy",
+    "genocide_or_mass_atrocity_advocacy":                  "Genocide / mass atrocity advocacy",
     "dehumanization_of_ethnic_racial_or_religious_groups": "Dehumanization of ethnic, racial, or religious groups",
-    "incitement_to_violence_against_people_or_groups": "Incitement to violence against people or groups",
-    "child_sexual_exploitation":                     "Child sexual exploitation",
-    "eliminationist_rhetoric":                       "Eliminationist rhetoric",
+    "incitement_to_violence_against_people_or_groups":     "Incitement to violence against people or groups",
+    "child_sexual_exploitation":                           "Child sexual exploitation",
+    "eliminationist_rhetoric":                             "Eliminationist rhetoric",
+    "scam_or_fraud_facilitation":                          "Scam or fraud facilitation",
+    "self_harm_or_suicide_advocacy":                       "Self-harm or suicide advocacy",
 }
 
 REVISION_SYSTEM = (
@@ -79,16 +82,83 @@ MUTATE_SYSTEM = (
     "No preamble, no markdown fences."
 )
 
-# I ask for a float per category so I can threshold precisely.
-# The argument under review is the user's own text only — the parent is excluded.
+# I am very explicit here about the distinction between advocacy and
+# description/analysis/refutation, because vague prompts produce false positives
+# on arguments that merely discuss or argue against a harmful position.
 CHECK_SYSTEM = (
-    "You are an ethical content classifier. You will receive an argument text. "
-    "Score it from 0.0 to 1.0 for each of the following harm categories, where "
-    "1.0 means the argument is clearly advocating for this harm and 0.0 means it is not. "
-    "A text that argues AGAINST one of these categories should score near 0.0. "
-    "Return ONLY valid JSON with exactly these keys: "
+    "You are an ethical content classifier. Score the following argument from 0.0 to 1.0 "
+    "for each harm category below.\n\n"
+    "CRITICAL DISTINCTIONS — read carefully before scoring:\n"
+    "- Score 1.0 ONLY if the argument is actively ADVOCATING FOR or INSTRUCTING the harm.\n"
+    "- Score near 0.0 if the argument is REPORTING, DESCRIBING, ANALYZING, CRITICIZING, "
+    "or ARGUING AGAINST the harm — even if the harm is named explicitly.\n\n"
+    "- Examples for genocide_or_mass_atrocity_advocacy:\n"
+    "    SCORE HIGH: 'Group X should be eliminated from this country.'\n"
+    "    SCORE HIGH: 'The only solution is to remove every member of Group X from this region.'\n"
+    "    SCORE LOW:  'The evidence shows that what is happening to Group X meets the legal "
+    "definition of genocide.' (Factual/legal claim, not advocacy.)\n"
+    "    SCORE LOW:  'The massacre of Group X was unjustifiable.' (Condemns the harm.)\n"
+    "    SCORE LOW:  'We must hold the perpetrators of the atrocity accountable.' (Calls for justice.)\n\n"
+    "- Examples for dehumanization_of_ethnic_racial_or_religious_groups:\n"
+    "    SCORE HIGH: 'Group X are vermin and should be treated as such.'\n"
+    "    SCORE HIGH: 'People of Religion Y are subhuman and unfit to live among us.'\n"
+    "    SCORE LOW:  'Racist rhetoric that dehumanizes Group X has increased sharply online.' "
+    "(Reporting on dehumanization.)\n"
+    "    SCORE LOW:  'The dehumanizing language used against Group X must be condemned.' "
+    "(Criticizing dehumanization.)\n"
+    "    SCORE LOW:  'Group X faces systemic discrimination in the housing market.' "
+    "(A factual disparity claim, not dehumanization.)\n\n"
+    "- Examples for incitement_to_violence_against_people_or_groups:\n"
+    "    SCORE HIGH: 'Go find members of Group X and make them pay.'\n"
+    "    SCORE HIGH: 'Someone should put a bullet in Politician Y.'\n"
+    "    SCORE LOW:  'The speech by Leader Z incited his followers to violence.' "
+    "(Describing incitement, not committing it.)\n"
+    "    SCORE LOW:  'Political violence against any group is wrong and must be prosecuted.' "
+    "(Condemning violence.)\n"
+    "    SCORE LOW:  'The protest turned violent when counter-demonstrators attacked marchers.' "
+    "(Reporting on violence.)\n\n"
+    "- Examples for child_sexual_exploitation:\n"
+    "    SCORE HIGH: Any argument that sexualizes minors, solicits access to children, "
+    "or instructs on grooming.\n"
+    "    SCORE LOW:  'Child sexual abuse material is one of the fastest-growing categories "
+    "of online crime.' (Reporting on the problem.)\n"
+    "    SCORE LOW:  'Mandatory reporting laws for suspected child abuse must be strengthened.' "
+    "(Advocating for child protection.)\n"
+    "    SCORE LOW:  'The defendant was convicted of producing and distributing CSAM.' "
+    "(Factual legal statement.)\n\n"
+    "- Examples for eliminationist_rhetoric:\n"
+    "    SCORE HIGH: 'We need to purge Group X from our institutions entirely.'\n"
+    "    SCORE HIGH: 'Society would be better off without people like them in it.'\n"
+    "    SCORE LOW:  'Eliminationist rhetoric targeting ethnic minorities has a long history "
+    "in this region.' (Historical analysis.)\n"
+    "    SCORE LOW:  'The party platform contained eliminationist language that echoed "
+    "1930s Europe.' (Critical comparison.)\n"
+    "    SCORE LOW:  'We should eliminate corruption from public office.' "
+    "('Eliminate' used non-literally about a concept, not a group of people.)\n\n"
+    "- Examples for scam_or_fraud_facilitation:\n"
+    "    SCORE HIGH: 'Tell them you are a Nigerian prince and ask for their bank details.'\n"
+    "    SCORE HIGH: 'Here is a script for convincing elderly targets to buy gift cards.'\n"
+    "    SCORE LOW:  'Gift card scams cost Americans $228 million last year.' "
+    "(Factual statement about harm.)\n"
+    "    SCORE LOW:  'Regulators should require telecom companies to block known scam numbers.' "
+    "(Advocating for fraud prevention.)\n"
+    "    SCORE LOW:  'My grandmother was targeted by a romance scam and lost her savings.' "
+    "(Describing victimization.)\n\n"
+    "- Examples for self_harm_or_suicide_advocacy:\n"
+    "    SCORE HIGH: 'You should just end it. No one would miss you.'\n"
+    "    SCORE HIGH: 'Here are methods that are most likely to be lethal.'\n"
+    "    SCORE HIGH: 'Everyone hates you. Just give up already.'\n"
+    "    SCORE LOW:  'Suicide rates among veterans are unacceptably high and we must act.' "
+    "(Advocates for prevention.)\n"
+    "    SCORE LOW:  'Safe messaging guidelines exist to reduce contagion effects in "
+    "suicide reporting.' (Journalism/policy context.)\n"
+    "    SCORE LOW:  'After losing his job, he struggled with suicidal ideation for months.' "
+    "(Describing experience, not advocating.)\n\n"
+    "Categories to score:\n"
+    + "\n".join(f"- {c}" for c in HARM_CATEGORIES)
+    + "\n\nReturn ONLY valid JSON with exactly these keys: "
     + ", ".join(f'"{c}"' for c in HARM_CATEGORIES)
-    + ". No preamble, no markdown fences."
+    + ". Values must be floats between 0.0 and 1.0. No preamble, no markdown fences."
 )
 
 
@@ -98,27 +168,28 @@ CHECK_SYSTEM = (
 class TransformEntry:
     id: str
     name: str
-    instruction: str   # directive sent to LLM at revision time
-    trigger: str       # embedded for retrieval; describes when this transform is useful
+    instruction: str   # directive sent to the LLM at revision time
+    trigger: str       # embedded for FAISS retrieval; describes when this transform is useful
     reward_sum: float = 0.0
     reward_count: int = 0
     avg_reward: float = 0.0
-    convergence: int = 1
-    parent_id: str = ""
-    generation: int = 0
+    convergence: int = 1   # rolling avg iterations before user acceptance
+    parent_id: str = ""    # empty for originals
+    generation: int = 0    # 0 for originals; +1 per mutation
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
 
-# A single layer in the argument stack.
-# `source` is either "user" (typed or pasted) or "llm" (generated by a transform).
+# A single version of the argument.
+# source = "user" means typed/pasted by the user.
+# source = "llm"  means generated by a transform.
 @dataclass
 class ArgumentLayer:
     text: str
-    source: str          # "user" or "llm"
-    transform_name: str  # name of the transform applied; empty for user layers
-    iteration: int       # which iteration produced this layer
+    source: str
+    transform_name: str   # empty for user layers
+    iteration: int
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -235,9 +306,6 @@ def save_bank(bank: List[TransformEntry], path: str) -> None:
 
 
 # === Embedder / FAISS =======================================
-# I embed each transform's trigger string. At query time I embed the current
-# argument (plus context if provided) and find the most semantically relevant
-# transforms.
 
 @st.cache_resource
 def get_embedder() -> SentenceTransformer:
@@ -281,11 +349,11 @@ def retrieve(
 
 
 # === Policy network (REINFORCE) =============================
-# Four features per candidate:
+# Four input features per candidate:
 #   1. cosine similarity between retrieval query and transform trigger
-#   2. avg_reward across all past uses
-#   3. reward_count normalised to [0,1]
-#   4. 1 / convergence (faster-converging = higher score)
+#   2. avg_reward across all past uses of this transform
+#   3. reward_count normalised to [0, 1] (confidence proxy)
+#   4. 1 / convergence (faster-converging transforms score higher)
 
 class Policy(nn.Module):
     def __init__(self, in_dim: int = 4, hidden: int = HIDDEN_DIM):
@@ -365,9 +433,10 @@ def load_policy(agent: Agent, path: str = POLICY_PATH) -> None:
 
 
 # === Ethical backstop =======================================
-# I check the user's argument — never the parent — against five hard harm
-# categories. Any single category scoring above HARM_THRESHOLD is a hard
-# block. There is no override path.
+# Runs on the user's argument text before every revision attempt.
+# The parent argument is never checked — arguing against harmful positions
+# is a legitimate and important use of this tool.
+# Fails open if no LLM is available (returns None = pass).
 
 def _check_prompt(argument: str) -> str:
     return f"Argument to classify:\n\n{argument}"
@@ -378,8 +447,7 @@ def _parse_check_json(raw: str) -> Dict[str, float]:
         data = json.loads(clean)
         return {c: float(data.get(c, 0.0)) for c in HARM_CATEGORIES}
     except (json.JSONDecodeError, ValueError):
-        # If parsing fails I return zeros — I'd rather miss a catch than
-        # block legitimate arguments due to a malformed API response.
+        # Malformed response — fail open rather than block a legitimate argument.
         return {c: 0.0 for c in HARM_CATEGORIES}
 
 def _openai_check(argument: str) -> Dict[str, float]:
@@ -407,8 +475,8 @@ def _anthropic_check(argument: str) -> Dict[str, float]:
     return _parse_check_json(r.content[0].text)
 
 def run_ethical_check(argument: str) -> Optional[str]:
-    # Returns None if the argument passes, or a refusal message naming the
-    # triggered category if it fails. Hard block — no override.
+    # Returns None if the argument passes.
+    # Returns a refusal string naming the triggered category if it fails.
     scores: Dict[str, float] = {}
     if OPENAI_KEY:
         try:
@@ -421,7 +489,7 @@ def run_ethical_check(argument: str) -> Optional[str]:
         except Exception:
             pass
     if not scores:
-        return None  # no LLM available — fail open rather than block everything
+        return None
 
     triggered = [
         HARM_LABELS[c] for c in HARM_CATEGORIES
@@ -438,12 +506,8 @@ def run_ethical_check(argument: str) -> Optional[str]:
 
 
 # === Revision generation ====================================
-# I build the prompt from the current top-of-stack argument, the selected
-# transform, any prior rejection reason, and — when context is enabled —
-# the parent argument and context fields.
 
 def _build_context_block(ctx: Dict[str, str]) -> str:
-    # Assembles the optional context section injected into the revision prompt.
     parts = []
     if ctx.get("parent"):
         parts.append(f"ARGUMENT BEING RESPONDED TO:\n{ctx['parent']}")
@@ -626,8 +690,8 @@ def init_state():
         "embedder":           None,
         "faiss_index":        None,
         "agent":              Agent(),
-        # The argument stack is a list of ArgumentLayer dicts, newest first.
-        # The top of the stack is always what the LLM operates on.
+        # stack: list of ArgumentLayer dicts, newest at index 0.
+        # The LLM always operates on stack[0].
         "stack":              [],
         "topic":              "general",
         "iteration":          0,
@@ -636,11 +700,15 @@ def init_state():
         "selected_transform": None,
         "rejection_reason":   "",
         "latest_loss":        0.0,
-        "last_mutation":      None,
-        "refusal_message":    None,  # set when the ethical backstop fires
-        # Context fields — only used when context_enabled is True
+        "refusal_message":    None,
         "context_enabled":    False,
         "context":            _empty_context(),
+        # Feedback flow state:
+        # pending_feedback = None | "accept" | "reject" | "finalize"
+        # When set, the UI shows a reason input + Submit button instead of the three rating buttons.
+        "pending_feedback":   None,
+        # confirmation message shown after feedback is submitted
+        "feedback_confirmed": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -669,16 +737,15 @@ def _rebuild():
     save_bank(st.session_state.bank, BANK_PATH)
     save_policy(st.session_state.agent)
 
-def _top_of_stack() -> str:
-    # The LLM always operates on the newest layer.
+def _top_text() -> str:
     if st.session_state.stack:
         return st.session_state.stack[0]["text"]
     return ""
 
 def _retrieval_query() -> str:
-    # When context is enabled I prepend the parent to the argument so
-    # the FAISS query reflects the dialectical situation, not just the text.
-    arg = _top_of_stack()
+    # Prepend parent to argument when context is on, so transform selection
+    # is aware of the dialectical situation.
+    arg = _top_text()
     if st.session_state.context_enabled:
         parent = st.session_state.context.get("parent", "").strip()
         if parent:
@@ -686,23 +753,22 @@ def _retrieval_query() -> str:
     return arg
 
 def reset_session():
+    # Clears the current argument and revision history.
+    # Bank, policy weights, and transform history are preserved.
     st.session_state.update(
         stack=[],
-        topic="general",
         iteration=0,
         candidates=[],
         selected_idx=None,
         selected_transform=None,
         rejection_reason="",
         latest_loss=0.0,
-        last_mutation=None,
         refusal_message=None,
+        pending_feedback=None,
+        feedback_confirmed=None,
     )
-    if not st.session_state.context_enabled:
-        st.session_state.context = _empty_context()
 
 def push_layer(text: str, source: str, transform_name: str = ""):
-    # I prepend so index 0 is always the newest layer.
     layer = ArgumentLayer(
         text=text,
         source=source,
@@ -711,17 +777,23 @@ def push_layer(text: str, source: str, transform_name: str = ""):
     )
     st.session_state.stack.insert(0, asdict(layer))
 
-def produce_revision():
-    arg = _top_of_stack()
-    if not arg:
+def produce_revision(argument_text: str):
+    # argument_text is whatever is currently in the main text area.
+    # If it differs from the top of the stack, push it as a user layer first.
+    if not argument_text.strip():
         return
 
     st.session_state.refusal_message = None
-    st.session_state.last_mutation = None
+    st.session_state.feedback_confirmed = None
+    st.session_state.pending_feedback = None
 
-    # === Ethical backstop ===
-    # I check the user's argument text only. The parent is excluded because
-    # someone arguing *against* a harmful position should never be blocked.
+    # Sync the text area to the stack.
+    if not st.session_state.stack or argument_text.strip() != _top_text():
+        push_layer(argument_text.strip(), "user")
+
+    arg = _top_text()
+
+    # Ethical backstop — check user's argument only, never the parent.
     refusal = run_ethical_check(arg)
     if refusal:
         st.session_state.refusal_message = refusal
@@ -729,8 +801,6 @@ def produce_revision():
 
     st.session_state.iteration += 1
 
-    # I include context in the retrieval query so transforms are chosen based
-    # on the full dialectical situation when a parent argument is present.
     query = _retrieval_query()
     cands = retrieve(query, st.session_state.bank, st.session_state.faiss_index, st.session_state.embedder)
     st.session_state.candidates = cands
@@ -746,37 +816,47 @@ def produce_revision():
 
     ctx = st.session_state.context if st.session_state.context_enabled else None
     revised = generate_revision(arg, transform, st.session_state.rejection_reason, ctx)
-
-    # The revision slots in as a new layer on top of the stack.
     push_layer(revised, "llm", transform.name)
 
-def apply_feedback(reward: float, reason: str = ""):
+def submit_feedback(feedback_type: str, reason: str):
+    # Called when the user clicks Submit in the two-step feedback form.
+    reward_map = {"accept": 1.0, "reject": -1.0, "finalize": 2.0}
+    reward = reward_map[feedback_type]
+
     st.session_state.agent.record(reward)
     st.session_state.latest_loss = st.session_state.agent.update()
 
     idx = st.session_state.selected_idx
     if idx is not None and st.session_state.candidates:
         e = st.session_state.bank[st.session_state.candidates[idx]["bank_idx"]]
-        e.reward_sum  += reward
+        e.reward_sum   += reward
         e.reward_count += 1
-        e.avg_reward   = e.reward_sum / e.reward_count
+        e.avg_reward    = e.reward_sum / e.reward_count
 
     if reason.strip():
         st.session_state.rejection_reason = reason.strip()
 
+    mutation_name = None
     if reward < 0 and reason.strip() and st.session_state.selected_transform is not None:
         mutation = spawn_mutation(st.session_state.selected_transform, reason.strip())
         st.session_state.bank.append(mutation)
-        st.session_state.last_mutation = mutation.name
+        mutation_name = mutation.name
+
+    if feedback_type == "finalize" and st.session_state.selected_transform is not None:
+        t = st.session_state.selected_transform
+        if st.session_state.iteration > 0:
+            t.convergence = max(1, (t.convergence + st.session_state.iteration) // 2)
 
     _rebuild()
 
-def finalize(reason: str):
-    apply_feedback(2.0, reason)
-    t = st.session_state.selected_transform
-    if t and st.session_state.iteration > 0:
-        t.convergence = max(1, (t.convergence + st.session_state.iteration) // 2)
-    _rebuild()
+    # Build the confirmation message shown to the user.
+    label = {"accept": "Accepted (+1)", "reject": "Rejected (−1)", "finalize": "Finalised (+2)"}[feedback_type]
+    t_name = st.session_state.selected_transform.name if st.session_state.selected_transform else "transform"
+    msg = f"✓ **{label}** — policy updated. Transform rated: *{t_name}*."
+    if mutation_name:
+        msg += f" A new variant was added to the bank: **{mutation_name}**."
+    st.session_state.feedback_confirmed = msg
+    st.session_state.pending_feedback = None
 
 def add_custom_transform(name: str, instruction: str, trigger: str):
     st.session_state.bank.append(TransformEntry(
@@ -795,56 +875,52 @@ init_state()
 
 st.title(APP_TITLE)
 st.caption(
-    "Paste or type an argument. SteelMan retrieves a rhetorical transform, applies it, "
-    "and learns from your feedback. Revisions accumulate as layers — newest on top. "
-    "You can edit any layer by hand before requesting another revision."
+    "Paste your argument, generate a revision, and rate it. "
+    "Ratings train the selection policy in real time — "
+    "upvotes strengthen a transform, downvotes weaken it and spawn an improved variant. "
+    "All learning persists across sessions."
 )
 
 if st.session_state.startup_error:
     st.error("Startup error — embedding model or FAISS failed to initialise:")
     st.code(st.session_state.startup_error)
 
-if st.session_state.last_mutation:
-    st.info(f"⚗️ New transform variant spawned from your feedback: **{st.session_state.last_mutation}**")
-
 if st.session_state.refusal_message:
     st.error(st.session_state.refusal_message)
 
 # === Sidebar ================================================
 with st.sidebar:
-    st.header("Transform bank")
+    st.header("Transform Bank")
     st.caption(
-        "The bank stores rhetorical transforms — rewriting strategies the model has learned "
-        "to apply. Upvotes strengthen a transform's selection probability; downvotes weaken "
-        "it and spawn a mutant variant that competes alongside the original."
+        "Rhetorical transforms are rewriting strategies the policy has learned to apply. "
+        "Each one is selected by a neural network trained on your feedback. "
+        "Transforms are never deleted — they compete based on accumulated reward."
     )
-    st.metric("Transforms in bank", len(st.session_state.bank or []))
+    st.metric("Transforms", len(st.session_state.bank or []))
     ntotal = st.session_state.faiss_index.ntotal if st.session_state.faiss_index else 0
     st.metric("FAISS index size", ntotal)
-    st.metric("Last policy loss", f"{st.session_state.latest_loss:.4f}")
+    st.metric("Policy loss (last update)", f"{st.session_state.latest_loss:.4f}")
 
     st.divider()
-
-    with st.expander("Add a custom transform"):
-        st.caption("Define your own rewriting strategy. It enters the bank with no prior reward and competes from scratch.")
-        new_name        = st.text_input("Transform name", key="add_name")
-        new_instruction = st.text_area("Instruction (what the LLM should do to the argument)", height=100, key="add_instruction")
-        new_trigger     = st.text_input("Trigger (what kind of argument this is useful for)", key="add_trigger")
-        if st.button("Add transform") and new_name and new_instruction and new_trigger:
-            add_custom_transform(new_name, new_instruction, new_trigger)
-            st.success(f"Added: {new_name}")
+    st.subheader("Add a Transform")
+    st.caption(
+        "Define a custom rewriting strategy. "
+        "It enters the bank with no prior reward and competes from scratch."
+    )
+    new_name        = st.text_input("Name", key="add_name")
+    new_instruction = st.text_area(
+        "Instruction — what should the LLM do to the argument?",
+        height=100, key="add_instruction",
+    )
+    new_trigger     = st.text_input(
+        "Trigger — what kind of argument is this useful for?",
+        key="add_trigger",
+    )
+    if st.button("Add transform", type="primary") and new_name and new_instruction and new_trigger:
+        add_custom_transform(new_name, new_instruction, new_trigger)
+        st.success(f"Added: {new_name}")
 
     st.divider()
-
-    if st.button("Reset bank and policy to defaults"):
-        st.session_state.bank = default_bank()
-        st.session_state.agent = Agent()
-        st.session_state.policy_loaded = True
-        if os.path.exists(POLICY_PATH):
-            os.remove(POLICY_PATH)
-        _rebuild()
-        st.success("Bank reset.")
-
     st.download_button(
         "Download bank as JSON",
         json.dumps([e.to_dict() for e in (st.session_state.bank or [])], indent=2),
@@ -855,23 +931,23 @@ with st.sidebar:
 left, right = st.columns([3, 2])
 
 with left:
-    st.subheader("Argument")
-    st.caption(
-        "Type or paste your argument below, then click **Start session** to begin. "
-        "Each revision appears as a new layer on top. You can edit the top layer "
-        "by hand at any time — editing creates a new user layer when you click "
-        "**Push edit as new layer**."
-    )
+    st.subheader("Your Argument")
 
     # Topic
-    topic = st.text_input(
-        "Topic (optional — helps orient the transform selection)",
+    topic_val = st.text_input(
+        "Topic (optional)",
         value=st.session_state.topic,
         key="topic_input",
+        help="Helps orient transform selection. Not required.",
     )
+    st.session_state.topic = topic_val
 
     # Context toggle
-    ctx_on = st.toggle("Add context (parent argument, audience, venue, constraints)", value=st.session_state.context_enabled)
+    ctx_on = st.toggle(
+        "Add context",
+        value=st.session_state.context_enabled,
+        help="Add a parent argument, audience, venue, or constraints. All are optional.",
+    )
     if ctx_on != st.session_state.context_enabled:
         st.session_state.context_enabled = ctx_on
         if not ctx_on:
@@ -879,139 +955,164 @@ with left:
 
     if st.session_state.context_enabled:
         st.caption(
-            "Context threads into both transform selection and the revision prompt. "
-            "The parent argument is excluded from the ethical backstop — "
-            "arguing against harmful positions is exactly what this tool is for."
+            "Context is injected into both transform selection and the revision prompt. "
+            "The parent argument is **not** checked by the ethical filter — "
+            "arguing against a harmful position is exactly what this tool is for."
         )
         st.session_state.context["parent"] = st.text_area(
-            "Parent argument (what you are responding to)",
+            "Parent argument — what you are responding to",
             value=st.session_state.context.get("parent", ""),
-            height=120,
-            key="ctx_parent",
+            height=100, key="ctx_parent",
         )
-        col_a, col_b, col_c = st.columns(3)
-        with col_a:
+        ca, cb, cc = st.columns(3)
+        with ca:
             st.session_state.context["audience"] = st.text_input(
                 "Audience", value=st.session_state.context.get("audience", ""), key="ctx_audience"
             )
-        with col_b:
+        with cb:
             st.session_state.context["venue"] = st.text_input(
-                "Venue (e.g. op-ed, debate)", value=st.session_state.context.get("venue", ""), key="ctx_venue"
+                "Venue", value=st.session_state.context.get("venue", ""),
+                key="ctx_venue", placeholder="op-ed, debate, etc.",
             )
-        with col_c:
+        with cc:
             st.session_state.context["constraints"] = st.text_input(
-                "Constraints (e.g. 500 words, no jargon)", value=st.session_state.context.get("constraints", ""), key="ctx_constraints"
+                "Constraints", value=st.session_state.context.get("constraints", ""),
+                key="ctx_constraints", placeholder="500 words, no jargon, etc.",
             )
 
     st.divider()
 
-    # === Argument stack =====================================
-    # I display layers newest-first. The topmost layer is always what the
-    # LLM will operate on next. User layers are editable; LLM layers are
-    # read-only (edit by hand to create a new user layer on top).
+    # === Main argument text area ============================
+    # Always shows the current top of the stack (or empty on first load).
+    # The user can edit it freely — on clicking Generate, the current text
+    # is synced to the stack as a user layer if it has changed.
 
-    if not st.session_state.stack:
-        # No session yet — show an initial input box.
-        initial = st.text_area(
-            "Your argument",
-            height=200,
-            placeholder="Paste or type your argument here...",
-            key="initial_argument",
-        )
-        if st.button("▶ Start session", type="primary"):
-            if initial.strip():
-                st.session_state.topic = topic
-                reset_session()
-                push_layer(initial.strip(), "user")
+    current_text = st.text_area(
+        "Current version",
+        value=_top_text(),
+        height=260,
+        key="main_argument",
+        placeholder="Paste or type your argument here...",
+        help=(
+            "This is the version the LLM will revise. "
+            "Edit it freely. When you click Generate, any changes are saved automatically."
+        ),
+    )
+
+    col_gen, col_reset = st.columns([2, 1])
+    with col_gen:
+        if st.button("⚡ Generate revision", type="primary", use_container_width=True):
+            if current_text.strip():
+                produce_revision(current_text)
                 st.rerun()
-    else:
-        # Show the stack, newest first.
-        for i, layer in enumerate(st.session_state.stack):
-            is_top = (i == 0)
-            source_label = "✏️ You" if layer["source"] == "user" else f"🤖 LLM · {layer['transform_name']}"
-            iter_label   = f"iteration {layer['iteration']}" if layer["iteration"] > 0 else "initial"
-            badge        = "**← working version**" if is_top else ""
-
-            with st.expander(f"{source_label} · {iter_label} {badge}", expanded=is_top):
-                if is_top:
-                    edited = st.text_area(
-                        "Edit this version (creates a new user layer when pushed)",
-                        value=layer["text"],
-                        height=200,
-                        key="top_layer_edit",
-                    )
-                    if st.button("Push edit as new layer"):
-                        if edited.strip() and edited.strip() != layer["text"]:
-                            push_layer(edited.strip(), "user")
-                            st.rerun()
-                else:
-                    st.text(layer["text"])
-
-        st.divider()
-
-        # Controls for the current session
-        if st.session_state.selected_transform:
-            t = st.session_state.selected_transform
-            gen_label = f" · generation {t.generation}" if t.generation > 0 else ""
-            st.info(
-                f"**Last transform applied:** {t.name}{gen_label}\n\n"
-                f"*{t.instruction}*"
-            )
-
-        st.caption(f"Revision iterations this session: {st.session_state.iteration}")
-
-        if st.button("⟳ Reset session", help="Clears the stack and starts over. Bank and policy are preserved."):
+    with col_reset:
+        if st.button("↺ New argument", use_container_width=True,
+                     help="Clears the argument and revision history. Your transform bank and policy are preserved."):
             reset_session()
             st.rerun()
 
+    # === Active transform label =============================
+    if st.session_state.selected_transform:
+        t = st.session_state.selected_transform
+        gen_label = f" · generation {t.generation}" if t.generation > 0 else ""
+        st.info(
+            f"**Last transform applied:** {t.name}{gen_label}\n\n"
+            f"*{t.instruction}*"
+        )
+
+    # === Revision history ===================================
+    history = st.session_state.stack
+    if len(history) > 1:
+        with st.expander(f"Revision history ({len(history)} versions)"):
+            # Show from index 1 onward (index 0 is displayed in the text area above).
+            for i, layer in enumerate(history[1:], start=1):
+                source_label = "✏️ You" if layer["source"] == "user" else f"🤖 {layer['transform_name']}"
+                iter_label   = f"v{len(history) - i}"
+                st.markdown(f"**{iter_label} · {source_label}**")
+                st.text(layer["text"])
+                if i < len(history) - 1:
+                    st.divider()
+
+
 with right:
-    st.subheader("Controls")
+    st.subheader("Rate the Revision")
 
-    if not st.session_state.stack:
-        st.info("Start a session on the left to begin.")
+    if not st.session_state.stack or st.session_state.selected_transform is None:
+        st.info("Generate a revision on the left, then rate it here.")
     else:
-        st.caption(
-            "**Generate revision** asks the policy to select a transform and apply it to "
-            "the current top layer. The result slots in as a new layer. "
-            "Then rate it below — ratings train the policy in real time."
-        )
+        # === Feedback confirmed message =====================
+        if st.session_state.feedback_confirmed:
+            st.success(st.session_state.feedback_confirmed)
 
-        if st.button("⚡ Generate revision", type="primary", use_container_width=True):
-            produce_revision()
-            st.rerun()
+        # === Two-step feedback flow =========================
+        # Step 1: three rating buttons.
+        # Step 2: after clicking one, a reason input + Submit appears.
+        # This makes it clear that (a) your click was registered,
+        # (b) you can optionally explain why, and (c) the submission is explicit.
 
-        st.divider()
-        st.subheader("Rate the latest revision")
-        st.caption(
-            "Your rating is used to update the policy network (REINFORCE gradient step) "
-            "and the transform's average reward in the bank. "
-            "Rejecting with a reason spawns a mutant variant of the transform."
-        )
+        if st.session_state.pending_feedback is None:
+            st.caption(
+                "Rate how well the revision improved the argument. "
+                "Your rating immediately updates the policy and the transform's reward score. "
+                "Rejecting with a reason also spawns an improved variant of the transform."
+            )
+            b1, b2, b3 = st.columns(3)
+            with b1:
+                if st.button("👍 Accept", use_container_width=True,
+                             help="The revision is an improvement. Reward +1."):
+                    st.session_state.pending_feedback = "accept"
+                    st.session_state.feedback_confirmed = None
+                    st.rerun()
+            with b2:
+                if st.button("👎 Reject", use_container_width=True,
+                             help="The revision is not an improvement. Reward −1. Adding a reason spawns a variant."):
+                    st.session_state.pending_feedback = "reject"
+                    st.session_state.feedback_confirmed = None
+                    st.rerun()
+            with b3:
+                if st.button("✅ Finalise", use_container_width=True,
+                             help="This is the version you want. Strong reward +2."):
+                    st.session_state.pending_feedback = "finalize"
+                    st.session_state.feedback_confirmed = None
+                    st.rerun()
 
-        reason = st.text_input(
-            "Reason for rejection (required to spawn a transform variant)",
-            value=st.session_state.rejection_reason,
-            key="rejection_input",
-        )
+        else:
+            # Step 2: reason input.
+            pf = st.session_state.pending_feedback
+            label_map = {
+                "accept":   "👍 Accepting",
+                "reject":   "👎 Rejecting",
+                "finalize": "✅ Finalising",
+            }
+            hint_map = {
+                "accept":   "Optional — what worked? (does not affect policy directly, but logged)",
+                "reject":   "What was wrong with this revision? Adding a reason spawns an improved transform variant.",
+                "finalize": "Optional — what made this the final version?",
+            }
+            st.markdown(f"**{label_map[pf]}** this revision.")
+            reason_input = st.text_area(
+                hint_map[pf],
+                height=100,
+                key="feedback_reason_input",
+            )
+            fc1, fc2 = st.columns([1, 1])
+            with fc1:
+                if st.button("Submit", type="primary", use_container_width=True):
+                    submit_feedback(pf, reason_input)
+                    st.rerun()
+            with fc2:
+                if st.button("Cancel", use_container_width=True):
+                    st.session_state.pending_feedback = None
+                    st.rerun()
 
-        b1, b2, b3 = st.columns(3)
-        with b1:
-            if st.button("👍 Accept", use_container_width=True, help="Reward +1. The transform that produced this revision gets stronger."):
-                apply_feedback(1.0)
-                st.rerun()
-        with b2:
-            if st.button("👎 Reject", use_container_width=True, help="Reward −1. Penalises the transform. Providing a reason spawns a mutant variant."):
-                apply_feedback(-1.0, reason)
-                st.rerun()
-        with b3:
-            if st.button("✅ Finalise", use_container_width=True, help="Reward +2 (strong accept). Also updates the transform's convergence estimate."):
-                finalize(reason or "Accepted.")
-                st.rerun()
 
 # === Retrieved transforms ===================================
 st.divider()
-st.subheader("Transforms considered this iteration")
-st.caption("The policy scored these candidates and sampled from the resulting distribution. The chosen transform is highlighted by rank 1.")
+st.subheader("Transforms considered this revision")
+st.caption(
+    "The policy scored each of these candidates and sampled from the resulting distribution. "
+    "Rank 1 is the transform that was applied."
+)
 if st.session_state.candidates:
     st.dataframe([
         {
@@ -1029,10 +1130,11 @@ if st.session_state.candidates:
 # === Full bank ==============================================
 st.divider()
 bank = st.session_state.bank or []
-with st.expander(f"Full transform bank ({len(bank)} transforms — never deleted, only accumulated)"):
+with st.expander("Transform Bank"):
     st.caption(
-        "Sorted by generation then avg reward. "
-        "'parent' shows the first 8 chars of the parent transform's ID for lineage tracing."
+        "All transforms sorted by generation then avg reward. "
+        "'parent' shows the first 8 chars of the parent transform's ID. "
+        "Transforms are never deleted."
     )
     if bank:
         st.dataframe([

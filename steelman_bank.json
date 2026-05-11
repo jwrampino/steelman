@@ -100,9 +100,9 @@
     "name": "Clarify and Intensify the Opening",
     "instruction": "Rewrite the opening sentences to clearly state the main argument or claim with specific language that highlights its significance. Eliminate any vague or general statements that do not directly contribute to the core message.",
     "trigger": "argument lacks clarity and urgency in presenting the main point",
-    "reward_sum": 0.0,
-    "reward_count": 0,
-    "avg_reward": 0.0,
+    "reward_sum": 1.0,
+    "reward_count": 1,
+    "avg_reward": 1.0,
     "convergence": 2,
     "parent_id": "0e51b95f-bf0e-4262-abe1-838d9578ae6b",
     "generation": 1
