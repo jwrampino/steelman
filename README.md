@@ -2,7 +2,10 @@
 
 Dependencies:
 ```
-pip install streamlit faiss-cpu sentence-transformers torch openai anthropic
+conda env create -f steelman.yml
+```
+```
+conda activate steelman
 ```
 
 How to run:
