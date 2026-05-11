@@ -1,42 +1,110 @@
 [
   {
-    "id": "692e0ff2-86f3-4086-a8fe-12e4390c283b",
-    "text": "Cities should reduce car dependency rather than simply 'ban cars.' Transportation is a major source of urban emissions, and policies like congestion pricing, protected bike lanes, and frequent public transit have reduced pollution in comparable cities without eliminating mobility.",
-    "topic": "urban policy",
-    "reward_sum": 4.0,
-    "reward_count": 5,
-    "avg_reward": 0.8,
-    "iterations_to_convergence": 2,
-    "convinced_reason": "Specific, evidence-based, and less absolutist."
-  },
-  {
-    "id": "2938c012-b31a-4923-8895-1f3bbce263ad",
-    "text": "A persuasive argument is usually stronger when it anticipates the strongest objection. Instead of asserting that opponents are ignorant, explain why a reasonable person might disagree and then respond directly to that concern.",
-    "topic": "rhetoric",
-    "reward_sum": 5.0,
-    "reward_count": 5,
-    "avg_reward": 1.0,
-    "iterations_to_convergence": 1,
-    "convinced_reason": "Balanced tone and strong counterargument handling."
-  },
-  {
-    "id": "12a51012-6e3a-4937-9b3e-e5ea2f63105d",
-    "text": "If the goal is persuasion rather than self-expression, claims should be narrowed to what can actually be defended. Replace sweeping statements with precise claims, concrete evidence, and one clearly stated mechanism.",
-    "topic": "argumentation",
+    "id": "3594d91e-6716-4d6c-88a7-c281b7d0526b",
+    "name": "Narrow the claim",
+    "instruction": "Replace overly broad or absolute assertions with narrower, defensible versions. Scope each claim to what the evidence actually supports. Remove or qualify 'always', 'never', 'all', 'everyone', 'no one'.",
+    "trigger": "argument makes sweeping generalizations or overreaches its evidence",
     "reward_sum": 4.0,
     "reward_count": 4,
     "avg_reward": 1.0,
-    "iterations_to_convergence": 1,
-    "convinced_reason": "More defensible and easier to follow."
+    "convergence": 1,
+    "parent_id": "",
+    "generation": 0
   },
   {
-    "id": "de9b0d55-e860-46de-935f-c6867f34cd00",
-    "text": "Arguments often fail because they overreach. A narrower claim that admits limits can be more persuasive than a maximal claim that invites easy rebuttal.",
-    "topic": "argumentation",
+    "id": "2e50e796-c3eb-4bff-ac0e-17d503ec14cf",
+    "name": "Preempt the strongest objection",
+    "instruction": "Identify the single most damaging objection a reasonable opponent would raise. Insert one sentence acknowledging it, then counter it directly. Do not strawman; engage the strongest version of the objection.",
+    "trigger": "argument ignores obvious counterarguments or sounds one-sided",
+    "reward_sum": 4.0,
+    "reward_count": 4,
+    "avg_reward": 1.0,
+    "convergence": 1,
+    "parent_id": "",
+    "generation": 0
+  },
+  {
+    "id": "53618804-84c0-4124-96ed-305a4a96eeda",
+    "name": "Make the mechanism explicit",
+    "instruction": "Find where the argument relies on an unstated causal or logical link. Insert one sentence naming the mechanism connecting the premise to the conclusion. Do not add new claims — only make the implicit explicit.",
+    "trigger": "argument asserts a causal relationship without explaining how or why",
+    "reward_sum": 4.5,
+    "reward_count": 5,
+    "avg_reward": 0.9,
+    "convergence": 2,
+    "parent_id": "",
+    "generation": 0
+  },
+  {
+    "id": "97ee78d1-7381-41da-9efa-ccb435239063",
+    "name": "Ground in concrete evidence",
+    "instruction": "Replace at least one abstract assertion with a specific example, statistic, case study, or named instance that supports the same point. Keep it plausible and precise; do not fabricate data.",
+    "trigger": "argument is entirely abstract with no empirical grounding",
     "reward_sum": 3.0,
     "reward_count": 4,
     "avg_reward": 0.75,
-    "iterations_to_convergence": 2,
-    "convinced_reason": "Measured tone felt more credible."
+    "convergence": 2,
+    "parent_id": "",
+    "generation": 0
+  },
+  {
+    "id": "0e51b95f-bf0e-4262-abe1-838d9578ae6b",
+    "name": "Sharpen the opening",
+    "instruction": "Rewrite only the first one or two sentences so they immediately establish the central tension or stake. Cut any preamble, scene-setting, or hedging that delays the core claim.",
+    "trigger": "argument buries the main point or opens with unnecessary context",
+    "reward_sum": 1.5,
+    "reward_count": 4,
+    "avg_reward": 0.375,
+    "convergence": 2,
+    "parent_id": "",
+    "generation": 0
+  },
+  {
+    "id": "37faad81-552b-4837-9681-e458a319e544",
+    "name": "Neutralize loaded language",
+    "instruction": "Identify words or phrases carrying strong emotional valence or in-group signaling likely to alienate a skeptical reader. Replace each with neutral, precise language that preserves the meaning.",
+    "trigger": "argument uses partisan, emotionally charged, or tribal language",
+    "reward_sum": 3.0,
+    "reward_count": 4,
+    "avg_reward": 0.75,
+    "convergence": 2,
+    "parent_id": "",
+    "generation": 0
+  },
+  {
+    "id": "b0b85530-7e28-4606-bc08-44737d6fd7f4",
+    "name": "Tighten the logical chain",
+    "instruction": "Find inferential gaps where the argument jumps from premise to conclusion without a bridging step. Add one sentence per gap. Also remove redundant restatements of points already made.",
+    "trigger": "argument has logical gaps or repeats the same point multiple times",
+    "reward_sum": 2.5,
+    "reward_count": 3,
+    "avg_reward": 0.83,
+    "convergence": 2,
+    "parent_id": "",
+    "generation": 0
+  },
+  {
+    "id": "57c090e1-25b5-4748-bd27-a5cfdafffc64",
+    "name": "Reframe for the skeptic",
+    "instruction": "Identify the core values or concerns of the audience that needs convincing — not those who already agree. Reframe the central claim in terms of those values without changing the underlying position.",
+    "trigger": "argument is framed for believers rather than skeptics",
+    "reward_sum": 2.0,
+    "reward_count": 3,
+    "avg_reward": 0.67,
+    "convergence": 3,
+    "parent_id": "",
+    "generation": 0
+  },
+  {
+    "id": "01d8d84b-81fb-4ae5-8827-5b549e9e06e0",
+    "name": "Clarify and Intensify the Opening",
+    "instruction": "Rewrite the opening sentences to clearly state the main argument or claim with specific language that highlights its significance. Eliminate any vague or general statements that do not directly contribute to the core message.",
+    "trigger": "argument lacks clarity and urgency in presenting the main point",
+    "reward_sum": 0.0,
+    "reward_count": 0,
+    "avg_reward": 0.0,
+    "convergence": 2,
+    "parent_id": "0e51b95f-bf0e-4262-abe1-838d9578ae6b",
+    "generation": 1
   }
 ]

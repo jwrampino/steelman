@@ -1,1065 +1,784 @@
 import os
 import json
 import uuid
+import re
+from dotenv import load_dotenv
 from dataclasses import dataclass, asdict
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 
 import numpy as np
 import streamlit as st
+import faiss
+from sentence_transformers import SentenceTransformer
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.distributions import Categorical
 
-# faiss
-try:
-    import faiss
-except ImportError:
-    raise ImportError("Please install faiss-cpu or faiss-gpu.")
+# === Config =================================================
+# I keep all tuneable knobs here so nothing is buried in logic.
 
-# embeddings
-try:
-    from sentence_transformers import SentenceTransformer
-except ImportError:
-    raise ImportError("Please install sentence-transformers.")
+load_dotenv()
 
-# RL
-try:
-    import torch
-    import torch.nn as nn
-    import torch.optim as optim
-    from torch.distributions import Categorical
-except ImportError:
-    raise ImportError("Please install torch.")
+APP_TITLE = "SteelMan"
+EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+BANK_PATH   = "steelman_bank.json"   # where I persist the transform library
+POLICY_PATH = "steelman_policy.pt"  # where I persist the learned network weights
 
-# ------------------------------------------------------------
-# CONFIG
-# ------------------------------------------------------------
+EMBED_DIM  = 384   # output dim of all-MiniLM-L6-v2
+TOP_K      = 8     # candidates I retrieve per query
+HIDDEN_DIM = 64    # policy network hidden layer width
+LR         = 1e-3  # Adam learning rate
+GAMMA      = 1.0   # discount factor; 1.0 = no discounting (single-step episodes)
+EPS        = 1e-8  # numerical stability floor for return normalisation
 
-APP_TITLE = "SteelMan Prototype"
-# FIX: Use the full HF repository name to avoid OSError
-EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2" 
-BANK_PATH = "steelman_bank.json"
-EMBED_DIM = 384  
-TOP_K_RETRIEVAL = 8
-POLICY_HIDDEN_DIM = 64
-LEARNING_RATE = 1e-3
-GAMMA = 1.0  
-EPS = 1e-8
+# I check both providers and use whichever key is present; OpenAI takes priority.
+OPENAI_KEY    = os.getenv("OPENAI_API_KEY", "")
+ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
-# Optional API settings:
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+# Swap these for whatever models you're targeting.
+REVISION_MODEL_ANTHROPIC = "claude-haiku-4-5-20251001"
+MUTATE_MODEL_ANTHROPIC   = "claude-haiku-4-5-20251001"
+REVISION_MODEL_OPENAI    = "gpt-4o-mini"
+MUTATE_MODEL_OPENAI      = "gpt-4o-mini"
 
-# ------------------------------------------------------------
-# DATA MODEL
-# ------------------------------------------------------------
+# I use a tight system prompt for revisions: apply the transform, nothing else.
+REVISION_SYSTEM = (
+    "You are a precision rhetoric editor. Apply ONLY the specified transformation to the "
+    "argument. Preserve the author's position and voice. Output only the revised argument, "
+    "no preamble, no explanation."
+)
+
+# For mutations I want structured output, so I ask explicitly for JSON.
+MUTATE_SYSTEM = (
+    "You are a meta-rhetoric engineer. A rhetorical transform failed on a specific argument. "
+    "Produce an improved variant that addresses the failure. "
+    "Return ONLY valid JSON with keys: name (str), instruction (str), trigger (str). "
+    "No preamble, no markdown fences."
+)
+
+
+# === Data model =============================================
+# I represent each rhetorical transform as a single entry in the bank.
+# `instruction` is what I send to the LLM at revision time.
+# `trigger` is what I embed for semantic retrieval — it describes when this
+# transform is useful, so the cosine search can match it against the argument.
+# `parent_id` and `generation` track mutation lineage; originals have both empty/0.
+# I never delete entries — only append and accumulate reward signal.
 
 @dataclass
-class ArgumentEntry:
+class TransformEntry:
     id: str
-    text: str
-    topic: str
-    reward_sum: float
-    reward_count: int
-    avg_reward: float
-    iterations_to_convergence: int
-    convinced_reason: str
+    name: str
+    instruction: str
+    trigger: str
+    reward_sum: float = 0.0
+    reward_count: int = 0
+    avg_reward: float = 0.0
+    convergence: int = 1   # rolling avg iterations it took the user to accept this transform
+    parent_id: str = ""    # id of the transform I mutated from; empty for originals
+    generation: int = 0    # how many mutations deep I am from the original
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
 
-# ------------------------------------------------------------
-# DEFAULT BANK
-# ------------------------------------------------------------
+# === Default bank ===========================================
+# I seed the bank with eight archetypal transforms covering the most common
+# failure modes in persuasive arguments. Each gets a small positive prior
+# so the policy has something to work with before real user feedback arrives.
 
-def default_bank() -> List[ArgumentEntry]:
-    seed = [
-        ArgumentEntry(
+def default_bank() -> List[TransformEntry]:
+    return [
+        TransformEntry(
             id=str(uuid.uuid4()),
-            text=(
-                "Cities should reduce car dependency rather than simply 'ban cars.' "
-                "Transportation is a major source of urban emissions, and policies like "
-                "congestion pricing, protected bike lanes, and frequent public transit have "
-                "reduced pollution in comparable cities without eliminating mobility."
+            name="Narrow the claim",
+            instruction=(
+                "Replace overly broad or absolute assertions with narrower, defensible versions. "
+                "Scope each claim to what the evidence actually supports. "
+                "Remove or qualify 'always', 'never', 'all', 'everyone', 'no one'."
             ),
-            topic="urban policy",
-            reward_sum=4.0,
-            reward_count=5,
-            avg_reward=0.8,
-            iterations_to_convergence=2,
-            convinced_reason="Specific, evidence-based, and less absolutist."
+            trigger="argument makes sweeping generalizations or overreaches its evidence",
+            reward_sum=4.0, reward_count=4, avg_reward=1.0, convergence=1,
         ),
-        ArgumentEntry(
+        TransformEntry(
             id=str(uuid.uuid4()),
-            text=(
-                "A persuasive argument is usually stronger when it anticipates the strongest "
-                "objection. Instead of asserting that opponents are ignorant, explain why a "
-                "reasonable person might disagree and then respond directly to that concern."
+            name="Preempt the strongest objection",
+            instruction=(
+                "Identify the single most damaging objection a reasonable opponent would raise. "
+                "Insert one sentence acknowledging it, then counter it directly. "
+                "Do not strawman; engage the strongest version of the objection."
             ),
-            topic="rhetoric",
-            reward_sum=5.0,
-            reward_count=5,
-            avg_reward=1.0,
-            iterations_to_convergence=1,
-            convinced_reason="Balanced tone and strong counterargument handling."
+            trigger="argument ignores obvious counterarguments or sounds one-sided",
+            reward_sum=4.0, reward_count=4, avg_reward=1.0, convergence=1,
         ),
-        ArgumentEntry(
+        TransformEntry(
             id=str(uuid.uuid4()),
-            text=(
-                "If the goal is persuasion rather than self-expression, claims should be narrowed "
-                "to what can actually be defended. Replace sweeping statements with precise claims, "
-                "concrete evidence, and one clearly stated mechanism."
+            name="Make the mechanism explicit",
+            instruction=(
+                "Find where the argument relies on an unstated causal or logical link. "
+                "Insert one sentence naming the mechanism connecting the premise to the conclusion. "
+                "Do not add new claims — only make the implicit explicit."
             ),
-            topic="argumentation",
-            reward_sum=4.0,
-            reward_count=4,
-            avg_reward=1.0,
-            iterations_to_convergence=1,
-            convinced_reason="More defensible and easier to follow."
+            trigger="argument asserts a causal relationship without explaining how or why",
+            reward_sum=3.5, reward_count=4, avg_reward=0.875, convergence=2,
         ),
-        ArgumentEntry(
+        TransformEntry(
             id=str(uuid.uuid4()),
-            text=(
-                "Arguments often fail because they overreach. A narrower claim that admits limits "
-                "can be more persuasive than a maximal claim that invites easy rebuttal."
+            name="Ground in concrete evidence",
+            instruction=(
+                "Replace at least one abstract assertion with a specific example, statistic, "
+                "case study, or named instance that supports the same point. "
+                "Keep it plausible and precise; do not fabricate data."
             ),
-            topic="argumentation",
-            reward_sum=3.0,
-            reward_count=4,
-            avg_reward=0.75,
-            iterations_to_convergence=2,
-            convinced_reason="Measured tone felt more credible."
+            trigger="argument is entirely abstract with no empirical grounding",
+            reward_sum=3.0, reward_count=4, avg_reward=0.75, convergence=2,
+        ),
+        TransformEntry(
+            id=str(uuid.uuid4()),
+            name="Sharpen the opening",
+            instruction=(
+                "Rewrite only the first one or two sentences so they immediately establish "
+                "the central tension or stake. Cut any preamble, scene-setting, or hedging "
+                "that delays the core claim."
+            ),
+            trigger="argument buries the main point or opens with unnecessary context",
+            reward_sum=2.5, reward_count=3, avg_reward=0.83, convergence=2,
+        ),
+        TransformEntry(
+            id=str(uuid.uuid4()),
+            name="Neutralize loaded language",
+            instruction=(
+                "Identify words or phrases carrying strong emotional valence or in-group "
+                "signaling likely to alienate a skeptical reader. Replace each with neutral, "
+                "precise language that preserves the meaning."
+            ),
+            trigger="argument uses partisan, emotionally charged, or tribal language",
+            reward_sum=3.0, reward_count=4, avg_reward=0.75, convergence=2,
+        ),
+        TransformEntry(
+            id=str(uuid.uuid4()),
+            name="Tighten the logical chain",
+            instruction=(
+                "Find inferential gaps where the argument jumps from premise to conclusion "
+                "without a bridging step. Add one sentence per gap. "
+                "Also remove redundant restatements of points already made."
+            ),
+            trigger="argument has logical gaps or repeats the same point multiple times",
+            reward_sum=2.5, reward_count=3, avg_reward=0.83, convergence=2,
+        ),
+        TransformEntry(
+            id=str(uuid.uuid4()),
+            name="Reframe for the skeptic",
+            instruction=(
+                "Identify the core values or concerns of the audience that needs convincing — "
+                "not those who already agree. Reframe the central claim in terms of those values "
+                "without changing the underlying position."
+            ),
+            trigger="argument is framed for believers rather than skeptics",
+            reward_sum=2.0, reward_count=3, avg_reward=0.67, convergence=3,
         ),
     ]
-    return seed
 
 
-# ------------------------------------------------------------
-# BANK / FAISS HELPERS
-# ------------------------------------------------------------
+# === Bank I/O ===============================================
+# I write the full bank on every feedback event, so the file is always
+# current and a restart loses nothing.
 
-def load_bank(path: str) -> List[ArgumentEntry]:
+def load_bank(path: str) -> List[TransformEntry]:
     if not os.path.exists(path):
+        # first run — seed with defaults and persist immediately
         bank = default_bank()
         save_bank(bank, path)
         return bank
-
     with open(path, "r", encoding="utf-8") as f:
-        raw = json.load(f)
+        return [TransformEntry(**item) for item in json.load(f)]
 
-    return [ArgumentEntry(**item) for item in raw]
-
-
-def save_bank(bank: List[ArgumentEntry], path: str) -> None:
+def save_bank(bank: List[TransformEntry], path: str) -> None:
     with open(path, "w", encoding="utf-8") as f:
-        json.dump([entry.to_dict() for entry in bank], f, indent=2, ensure_ascii=False)
+        json.dump([e.to_dict() for e in bank], f, indent=2, ensure_ascii=False)
 
 
-import os
-import json
-import uuid
-from dataclasses import dataclass, asdict
-from typing import List, Dict, Any, Tuple
-
-import numpy as np
-import streamlit as st
-
-# faiss
-try:
-    import faiss
-except ImportError:
-    raise ImportError("Please install faiss-cpu or faiss-gpu.")
-
-# embeddings
-try:
-    from sentence_transformers import SentenceTransformer
-except ImportError:
-    raise ImportError("Please install sentence-transformers.")
-
-# RL
-try:
-    import torch
-    import torch.nn as nn
-    import torch.optim as optim
-    from torch.distributions import Categorical
-except ImportError:
-    raise ImportError("Please install torch.")
-
-# ------------------------------------------------------------
-# CONFIG
-# ------------------------------------------------------------
-
-APP_TITLE = "SteelMan Prototype"
-# FIX: Use the full HF repository name to avoid OSError
-EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2" 
-BANK_PATH = "steelman_bank.json"
-EMBED_DIM = 384  
-TOP_K_RETRIEVAL = 8
-POLICY_HIDDEN_DIM = 64
-LEARNING_RATE = 1e-3
-GAMMA = 1.0  
-EPS = 1e-8
-
-# Optional API settings:
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-
-# ------------------------------------------------------------
-# DATA MODEL
-# ------------------------------------------------------------
-
-@dataclass
-class ArgumentEntry:
-    id: str
-    text: str
-    topic: str
-    reward_sum: float
-    reward_count: int
-    avg_reward: float
-    iterations_to_convergence: int
-    convinced_reason: str
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-
-# ------------------------------------------------------------
-# DEFAULT BANK
-# ------------------------------------------------------------
-
-def default_bank() -> List[ArgumentEntry]:
-    seed = [
-        ArgumentEntry(
-            id=str(uuid.uuid4()),
-            text=(
-                "Cities should reduce car dependency rather than simply 'ban cars.' "
-                "Transportation is a major source of urban emissions, and policies like "
-                "congestion pricing, protected bike lanes, and frequent public transit have "
-                "reduced pollution in comparable cities without eliminating mobility."
-            ),
-            topic="urban policy",
-            reward_sum=4.0,
-            reward_count=5,
-            avg_reward=0.8,
-            iterations_to_convergence=2,
-            convinced_reason="Specific, evidence-based, and less absolutist."
-        ),
-        ArgumentEntry(
-            id=str(uuid.uuid4()),
-            text=(
-                "A persuasive argument is usually stronger when it anticipates the strongest "
-                "objection. Instead of asserting that opponents are ignorant, explain why a "
-                "reasonable person might disagree and then respond directly to that concern."
-            ),
-            topic="rhetoric",
-            reward_sum=5.0,
-            reward_count=5,
-            avg_reward=1.0,
-            iterations_to_convergence=1,
-            convinced_reason="Balanced tone and strong counterargument handling."
-        ),
-        ArgumentEntry(
-            id=str(uuid.uuid4()),
-            text=(
-                "If the goal is persuasion rather than self-expression, claims should be narrowed "
-                "to what can actually be defended. Replace sweeping statements with precise claims, "
-                "concrete evidence, and one clearly stated mechanism."
-            ),
-            topic="argumentation",
-            reward_sum=4.0,
-            reward_count=4,
-            avg_reward=1.0,
-            iterations_to_convergence=1,
-            convinced_reason="More defensible and easier to follow."
-        ),
-        ArgumentEntry(
-            id=str(uuid.uuid4()),
-            text=(
-                "Arguments often fail because they overreach. A narrower claim that admits limits "
-                "can be more persuasive than a maximal claim that invites easy rebuttal."
-            ),
-            topic="argumentation",
-            reward_sum=3.0,
-            reward_count=4,
-            avg_reward=0.75,
-            iterations_to_convergence=2,
-            convinced_reason="Measured tone felt more credible."
-        ),
-    ]
-    return seed
-
-
-# ------------------------------------------------------------
-# BANK / FAISS HELPERS
-# ------------------------------------------------------------
-
-def load_bank(path: str) -> List[ArgumentEntry]:
-    if not os.path.exists(path):
-        bank = default_bank()
-        save_bank(bank, path)
-        return bank
-
-    with open(path, "r", encoding="utf-8") as f:
-        raw = json.load(f)
-
-    return [ArgumentEntry(**item) for item in raw]
-
-
-def save_bank(bank: List[ArgumentEntry], path: str) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump([entry.to_dict() for entry in bank], f, indent=2, ensure_ascii=False)
-
+# === Embedder / FAISS =======================================
+# I embed each transform's `trigger` string and index them with inner-product
+# search (cosine similarity on unit vectors). At query time I embed the
+# argument text and find the transforms whose trigger conditions are most
+# semantically similar to what the argument is doing.
 
 @st.cache_resource
 def get_embedder() -> SentenceTransformer:
-    # Try multiple identifiers to bypass the "not a valid model identifier" error
-    try:
-        return SentenceTransformer(EMBED_MODEL_NAME)
-    except Exception:
+    # I try the full HF repo name first, then the short alias, then local cache.
+    for name in (EMBED_MODEL, "all-MiniLM-L6-v2"):
         try:
-            # Fallback to the short name
-            return SentenceTransformer("all-MiniLM-L6-v2")
+            return SentenceTransformer(name)
         except Exception:
-            # Final attempt: force local only if it's already in your cache
-            return SentenceTransformer(EMBED_MODEL_NAME, local_files_only=True)
+            continue
+    return SentenceTransformer(EMBED_MODEL, local_files_only=True)
 
+def _norm(x: np.ndarray) -> np.ndarray:
+    # L2-normalise rows so inner product == cosine similarity
+    return x / (np.linalg.norm(x, axis=1, keepdims=True) + 1e-12)
 
-def normalize_rows(x: np.ndarray) -> np.ndarray:
-    norms = np.linalg.norm(x, axis=1, keepdims=True) + 1e-12
-    return x / norms
+def embed(texts: List[str], model: SentenceTransformer) -> np.ndarray:
+    e = model.encode(texts, convert_to_numpy=True, show_progress_bar=False).astype(np.float32)
+    return _norm(e)
 
+def build_index(bank: List[TransformEntry], model: SentenceTransformer) -> faiss.IndexFlatIP:
+    # I rebuild the index from scratch on every bank mutation — cheap enough
+    # at this scale, and avoids stale vectors after mutations or additions.
+    if not bank:
+        return faiss.IndexFlatIP(EMBED_DIM)
+    embs = embed([e.trigger for e in bank], model)
+    idx = faiss.IndexFlatIP(embs.shape[1])
+    idx.add(embs)
+    return idx
 
-def embed_texts(texts: List[str], model: SentenceTransformer) -> np.ndarray:
-    embs = model.encode(texts, convert_to_numpy=True, show_progress_bar=False)
-    embs = embs.astype(np.float32)
-    embs = normalize_rows(embs)
-    return embs
-
-
-def build_faiss_index(bank: List[ArgumentEntry], model: SentenceTransformer) -> Tuple[faiss.IndexFlatIP, np.ndarray]:
-    texts = [entry.text for entry in bank]
-    if len(texts) == 0:
-        index = faiss.IndexFlatIP(EMBED_DIM)
-        return index, np.zeros((0, EMBED_DIM), dtype=np.float32)
-
-    embs = embed_texts(texts, model)
-    index = faiss.IndexFlatIP(embs.shape[1])
-    index.add(embs)
-    return index, embs
-
-
-def retrieve_candidates(
-    query_text: str,
-    bank: List[ArgumentEntry],
+def retrieve(
+    query: str,
+    bank: List[TransformEntry],
     index: faiss.IndexFlatIP,
     model: SentenceTransformer,
-    top_k: int = TOP_K_RETRIEVAL,
+    k: int = TOP_K,
 ) -> List[Dict[str, Any]]:
-    if len(bank) == 0 or index.ntotal == 0:
+    # I return up to k candidates with their bank position, similarity score,
+    # and the full entry so the policy network can read all four features.
+    if not bank or index.ntotal == 0:
         return []
-
-    q = embed_texts([query_text], model)
-    sims, idxs = index.search(q, min(top_k, len(bank)))
-    sims = sims[0]
-    idxs = idxs[0]
-
-    out = []
-    for sim, idx in zip(sims, idxs):
-        if idx < 0: continue
-        entry = bank[int(idx)]
-        out.append({
-            "bank_idx": int(idx),
-            "similarity": float(sim),
-            "entry": entry,
-        })
-    return out
+    q = embed([query], model)
+    sims, idxs = index.search(q, min(k, len(bank)))
+    return [
+        {"bank_idx": int(i), "similarity": float(s), "entry": bank[int(i)]}
+        for s, i in zip(sims[0], idxs[0]) if i >= 0
+    ]
 
 
-# ------------------------------------------------------------
-# POLICY NETWORK (REINFORCE-STYLE)
-# ------------------------------------------------------------
+# === Policy network (REINFORCE) =============================
+# I score each candidate with a small MLP, then sample from the softmax
+# distribution. This lets me explore while still biasing toward historically
+# good transforms. The four input features are:
+#   1. cosine similarity between argument and transform trigger
+#   2. avg_reward of the transform across all past uses
+#   3. reward_count normalised to [0, 1] (proxy for confidence)
+#   4. 1 / convergence (faster-converging transforms score higher)
 
-class RetrievalPolicy(nn.Module):
-    def __init__(self, input_dim: int = 4, hidden_dim: int = POLICY_HIDDEN_DIM):
+class Policy(nn.Module):
+    def __init__(self, in_dim: int = 4, hidden: int = HIDDEN_DIM):
         super().__init__()
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc3 = nn.Linear(hidden_dim, 1)
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, 1),  # scalar score per candidate
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = torch.relu(self.fc1(x))
-        x = torch.relu(self.fc2(x))
-        scores = self.fc3(x).squeeze(-1)  
-        return scores
+        return self.net(x).squeeze(-1)
 
 
-class RetrievalAgent:
-    def __init__(self, learning_rate: float = LEARNING_RATE, gamma: float = GAMMA):
-        self.policy = RetrievalPolicy()
-        self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
-        self.gamma = gamma
+class Agent:
+    def __init__(self):
+        self.policy = Policy()
+        self.opt = optim.Adam(self.policy.parameters(), lr=LR)
+        # I accumulate log-probs and rewards within an episode (one argument
+        # session), then flush them on update().
         self.log_probs: List[torch.Tensor] = []
         self.rewards: List[float] = []
 
-    def candidate_features(self, candidates: List[Dict[str, Any]]) -> np.ndarray:
-        feats = []
-        for c in candidates:
-            entry = c["entry"]
-            similarity = c["similarity"]
-            avg_reward = entry.avg_reward
-            reward_count_norm = min(entry.reward_count / 10.0, 1.0)
-            inv_iterations_norm = 1.0 / max(entry.iterations_to_convergence, 1)
-            feats.append([
-                similarity,
-                avg_reward,
-                reward_count_norm,
-                inv_iterations_norm,
-            ])
-        return np.array(feats, dtype=np.float32)
+    def _features(self, candidates: List[Dict[str, Any]]) -> np.ndarray:
+        return np.array([
+            [
+                c["similarity"],
+                c["entry"].avg_reward,
+                min(c["entry"].reward_count / 10.0, 1.0),  # cap at 1
+                1.0 / max(c["entry"].convergence, 1),
+            ]
+            for c in candidates
+        ], dtype=np.float32)
 
-    def choose_candidate(self, candidates: List[Dict[str, Any]]) -> Tuple[int, np.ndarray]:
-        feats = self.candidate_features(candidates)
-        feats_tensor = torch.FloatTensor(feats)
+    def choose(self, candidates: List[Dict[str, Any]]) -> Tuple[int, np.ndarray]:
+        # I score all candidates, convert to a probability distribution, and
+        # sample — stochastic selection lets low-scoring transforms occasionally
+        # get picked and earn their way up (or confirm they should stay low).
+        feats = torch.FloatTensor(self._features(candidates))
+        probs = torch.softmax(self.policy(feats), dim=0)
+        dist  = Categorical(probs)
+        a     = dist.sample()
+        self.log_probs.append(dist.log_prob(a))
+        return int(a.item()), probs.detach().cpu().numpy()
 
-        scores = self.policy(feats_tensor)
-        probs = torch.softmax(scores, dim=0)
+    def record(self, r: float) -> None:
+        self.rewards.append(float(r))
 
-        dist = Categorical(probs)
-        action = dist.sample()
-        log_prob = dist.log_prob(action)
-
-        self.log_probs.append(log_prob)
-
-        return int(action.item()), probs.detach().cpu().numpy()
-
-    def record_reward(self, reward: float) -> None:
-        self.rewards.append(float(reward))
-
-    def update_policy(self) -> float:
-        if len(self.rewards) == 0 or len(self.log_probs) == 0:
+    def update(self) -> float:
+        # Standard REINFORCE: compute discounted returns, normalise them,
+        # then backprop -log_prob * return for each step in the episode.
+        # I flush both buffers afterward so the next episode starts clean.
+        if not self.rewards:
             return 0.0
-
-        returns = []
-        R = 0.0
+        R, returns = 0.0, []
         for r in reversed(self.rewards):
-            R = r + self.gamma * R
+            R = r + GAMMA * R
             returns.insert(0, R)
-
-        returns_tensor = torch.tensor(returns, dtype=torch.float32)
-        if len(returns_tensor) > 1:
-            returns_tensor = (returns_tensor - returns_tensor.mean()) / (returns_tensor.std() + EPS)
-
-        policy_losses = []
-        for log_prob, R in zip(self.log_probs, returns_tensor):
-            policy_losses.append(-log_prob * R)
-
-        self.optimizer.zero_grad()
-        loss = torch.stack(policy_losses).sum()
+        ret = torch.tensor(returns, dtype=torch.float32)
+        if len(ret) > 1:
+            ret = (ret - ret.mean()) / (ret.std() + EPS)
+        loss = torch.stack([-lp * r for lp, r in zip(self.log_probs, ret)]).sum()
+        self.opt.zero_grad()
         loss.backward()
-        self.optimizer.step()
-
-        loss_value = float(loss.item())
-
-        self.log_probs = []
-        self.rewards = []
-
-        return loss_value
+        self.opt.step()
+        self.log_probs.clear()
+        self.rewards.clear()
+        return float(loss.item())
 
 
-# ------------------------------------------------------------
-# REVISION GENERATION
-# ------------------------------------------------------------
+# === Policy persistence =====================================
+# I save both the network weights and the optimiser state so momentum
+# and adaptive learning rates carry over across restarts.
 
-def fallback_revision(user_argument: str, exemplar: str, reason: str = "") -> str:
-    reason_clause = ""
-    if reason.strip():
-        reason_clause = f" Also address this criticism from the user: {reason.strip()}"
+def save_policy(agent: Agent, path: str = POLICY_PATH) -> None:
+    torch.save({
+        "policy_state": agent.policy.state_dict(),
+        "opt_state":    agent.opt.state_dict(),
+    }, path)
 
+def load_policy(agent: Agent, path: str = POLICY_PATH) -> None:
+    if not os.path.exists(path):
+        return  # first run — nothing to load
+    ckpt = torch.load(path, map_location="cpu")
+    agent.policy.load_state_dict(ckpt["policy_state"])
+    agent.opt.load_state_dict(ckpt["opt_state"])
+
+
+# === Revision generation ====================================
+# I build a tightly scoped prompt: name the transform, give the instruction,
+# hand over the argument. The system prompt forbids the model from doing
+# anything other than applying the transform, which keeps revisions surgical.
+
+def _revision_prompt(argument: str, transform: TransformEntry, rejection_reason: str = "") -> str:
+    extra = (
+        f"\n\nNote: a previous revision was rejected. User said: {rejection_reason.strip()}"
+        if rejection_reason.strip() else ""
+    )
     return (
-        "Suggested revision:\n\n"
-        f"{user_argument.strip()}\n\n"
-        "Revised toward stronger persuasion:\n"
-        "Narrow the claim, make one mechanism explicit, and replace absolute language with defensible scope. "
-        f"Use this retrieved exemplar as guidance: {exemplar.strip()[:450]}..."
-        f"{reason_clause}"
+        f"TRANSFORMATION: {transform.name}\n"
+        f"INSTRUCTION: {transform.instruction}\n\n"
+        f"ARGUMENT TO REVISE:\n{argument}{extra}"
     )
 
-
-def openai_revision(user_argument: str, exemplar: str, reason: str = "") -> str:
+def _openai_revision(argument: str, transform: TransformEntry, reason: str = "") -> str:
     from openai import OpenAI
-    client = OpenAI(api_key=OPENAI_API_KEY)
-    reason_clause = f"\nThe user previously rejected a revision and said: {reason.strip()}" if reason.strip() else ""
-
-    prompt = f"Original argument:\n{user_argument}\n\nExemplar:\n{exemplar}{reason_clause}\n\nRevise the original argument to be more persuasive."
-
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini", # FIXED: Use a real model name
-        temperature=0.4,
+    r = OpenAI(api_key=OPENAI_KEY).chat.completions.create(
+        model=REVISION_MODEL_OPENAI,
+        temperature=0.3,  # low temp — I want consistent application, not creativity
         messages=[
-            {"role": "system", "content": "You are a rigorous rhetoric assistant."},
-            {"role": "user", "content": prompt},
+            {"role": "system", "content": REVISION_SYSTEM},
+            {"role": "user",   "content": _revision_prompt(argument, transform, reason)},
         ],
     )
-    return resp.choices[0].message.content.strip()
+    return r.choices[0].message.content.strip()
 
-
-def anthropic_revision(user_argument: str, exemplar: str, reason: str = "") -> str:
+def _anthropic_revision(argument: str, transform: TransformEntry, reason: str = "") -> str:
     import anthropic
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    reason_clause = f"\nThe user previously rejected a revision and said: {reason.strip()}" if reason.strip() else ""
-
-    prompt = f"Original argument:\n{user_argument}\n\nExemplar:\n{exemplar}{reason_clause}\n\nRevise the original argument."
-
-    resp = client.messages.create(
-        model="claude-3-5-sonnet-20241022",
-        max_tokens=700,
-        temperature=0.4,
-        messages=[{"role": "user", "content": prompt}],
+    r = anthropic.Anthropic(api_key=ANTHROPIC_KEY).messages.create(
+        model=REVISION_MODEL_ANTHROPIC,
+        max_tokens=800,
+        temperature=0.3,
+        system=REVISION_SYSTEM,
+        messages=[{"role": "user", "content": _revision_prompt(argument, transform, reason)}],
     )
-    return resp.content[0].text.strip()
+    return r.content[0].text.strip()
 
-
-def generate_revision(user_argument: str, exemplar: str, rejection_reason: str = "") -> str:
-    if OPENAI_API_KEY:
-        try: return openai_revision(user_argument, exemplar, rejection_reason)
-        except Exception as e: return f"{fallback_revision(user_argument, exemplar, rejection_reason)}\n\n[OpenAI fallback: {e}]"
-    if ANTHROPIC_API_KEY:
-        try: return anthropic_revision(user_argument, exemplar, rejection_reason)
-        except Exception as e: return f"{fallback_revision(user_argument, exemplar, rejection_reason)}\n\n[Anthropic fallback: {e}]"
-    return fallback_revision(user_argument, exemplar, rejection_reason)
-
-
-# ------------------------------------------------------------
-# SESSION HELPERS
-# ------------------------------------------------------------
-
-def init_state():
-    if "startup_error" not in st.session_state: st.session_state.startup_error = None
-    if "bank" not in st.session_state: st.session_state.bank = load_bank(BANK_PATH)
-    if "embedder" not in st.session_state:
-        try: st.session_state.embedder = get_embedder()
-        except Exception as e:
-            st.session_state.embedder = None
-            st.session_state.startup_error = str(e)
-
-    if "faiss_index" not in st.session_state:
-        if st.session_state.get("embedder") is not None:
-            try:
-                index, embs = build_faiss_index(st.session_state.bank, st.session_state.embedder)
-                st.session_state.faiss_index = index
-                st.session_state.bank_embs = embs
-            except Exception as e:
-                st.session_state.faiss_index = None
-                st.session_state.startup_error = str(e)
-    
-    if "agent" not in st.session_state: st.session_state.agent = RetrievalAgent()
-    if "current_argument" not in st.session_state: st.session_state.current_argument = ""
-    if "current_topic" not in st.session_state: st.session_state.current_topic = "general"
-    if "current_iteration" not in st.session_state: st.session_state.current_iteration = 0
-    if "candidate_set" not in st.session_state: st.session_state.candidate_set = []
-    if "selected_candidate_local_idx" not in st.session_state: st.session_state.selected_candidate_local_idx = None
-    if "selected_candidate_probs" not in st.session_state: st.session_state.selected_candidate_probs = None
-    if "latest_revision" not in st.session_state: st.session_state.latest_revision = ""
-    if "latest_rejection_reason" not in st.session_state: st.session_state.latest_rejection_reason = ""
-    if "accepted_history" not in st.session_state: st.session_state.accepted_history = []
-    if "latest_loss" not in st.session_state: st.session_state.latest_loss = 0.0
-
-def rebuild_index():
-    index, embs = build_faiss_index(st.session_state.bank, st.session_state.embedder)
-    st.session_state.faiss_index = index
-    st.session_state.bank_embs = embs
-    save_bank(st.session_state.bank, BANK_PATH)
-
-def start_new_session(argument: str, topic: str):
-    st.session_state.current_argument = argument.strip()
-    st.session_state.current_topic = topic.strip() or "general"
-    st.session_state.current_iteration = 0
-    st.session_state.candidate_set = []
-    st.session_state.selected_candidate_local_idx = None
-    st.session_state.selected_candidate_probs = None
-    st.session_state.latest_revision = ""
-    st.session_state.latest_rejection_reason = ""
-    st.session_state.accepted_history = []
-    st.session_state.latest_loss = 0.0
-
-def produce_revision():
-    argument = st.session_state.current_argument
-    if not argument.strip(): return
-    st.session_state.current_iteration += 1
-    candidates = retrieve_candidates(argument, st.session_state.bank, st.session_state.faiss_index, st.session_state.embedder)
-    st.session_state.candidate_set = candidates
-    if not candidates:
-        st.session_state.latest_revision = fallback_revision(argument, "", st.session_state.latest_rejection_reason)
-        return
-    idx, probs = st.session_state.agent.choose_candidate(candidates)
-    st.session_state.selected_candidate_local_idx = idx
-    st.session_state.selected_candidate_probs = probs
-    st.session_state.latest_revision = generate_revision(argument, candidates[idx]["entry"].text, st.session_state.latest_rejection_reason)
-
-def apply_feedback(reward: float, reason: str = ""):
-    st.session_state.agent.record_reward(reward)
-    st.session_state.latest_loss = st.session_state.agent.update_policy()
-    idx = st.session_state.selected_candidate_local_idx
-    if idx is not None and st.session_state.candidate_set:
-        entry = st.session_state.bank[st.session_state.candidate_set[idx]["bank_idx"]]
-        entry.reward_sum += reward
-        entry.reward_count += 1
-        entry.avg_reward = entry.reward_sum / max(entry.reward_count, 1)
-    if reason.strip(): st.session_state.latest_rejection_reason = reason.strip()
-    rebuild_index()
-
-def finalize_winner(convinced_reason: str):
-    final_text = st.session_state.latest_revision.strip()
-    if not final_text: return
-    new_entry = ArgumentEntry(str(uuid.uuid4()), final_text, st.session_state.current_topic, 2.0, 1, 2.0, st.session_state.current_iteration, convinced_reason.strip())
-    st.session_state.bank.append(new_entry)
-    st.session_state.accepted_history.append(final_text)
-    rebuild_index()
-
-# ------------------------------------------------------------
-# UI
-# ------------------------------------------------------------
-
-st.set_page_config(page_title=APP_TITLE, layout="wide")
-init_state()
-
-st.title(APP_TITLE)
-st.caption("Iterative argument optimization with semantic retrieval, FAISS, and REINFORCE-style retrieval updates.")
-if st.session_state.get("startup_error"):
-    st.error("Startup problem: embedding model / FAISS initialization failed.")
-    st.code(st.session_state["startup_error"])
-
-with st.sidebar:
-    st.header("Settings")
-    st.write(f"Bank size: **{len(st.session_state.bank)}**")
-    st.write(f"FAISS vectors: **{st.session_state.faiss_index.ntotal if st.session_state.faiss_index else 0}**")
-    st.write(f"Last policy loss: **{st.session_state.latest_loss:.4f}**")
-    if st.button("Reset bank to defaults"):
-        st.session_state.bank = default_bank()
-        rebuild_index()
-    st.divider()
-    st.download_button("Download bank JSON", json.dumps([x.to_dict() for x in st.session_state.bank], indent=2), "bank.json")
-
-left, right = st.columns([1, 1])
-
-with left:
-    st.subheader("Input")
-    topic = st.text_input("Topic", value=st.session_state.current_topic)
-    argument = st.text_area("Argument / Claim", value=st.session_state.current_argument, height=250)
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("Start / Reset Session"): start_new_session(argument, topic)
-    with c2:
-        if st.button("Generate Revision"):
-            if argument.strip():
-                if argument.strip() != st.session_state.current_argument: start_new_session(argument, topic)
-                produce_revision()
-    st.write(f"Iterations: **{st.session_state.current_iteration}**")
-
-with right:
-    st.subheader("Revision Output")
-    if st.session_state.latest_revision:
-        st.text_area("Latest Revision", value=st.session_state.latest_revision, height=350)
-        reject_reason = st.text_input("Reason if rejected", value=st.session_state.latest_rejection_reason)
-        b1, b2, b3 = st.columns(3)
-        with b1:
-            if st.button("👍 Reward"): apply_feedback(1.0, "")
-        with b2:
-            if st.button("👎 Penalize"): apply_feedback(-1.0, reject_reason)
-        with b3:
-            if st.button("✅ Finalize"):
-                apply_feedback(2.0, "")
-                finalize_winner(reject_reason or "Convinced.")
-    else: st.info("No revision yet.")
-
-st.divider()
-st.subheader("Retrieved Candidates")
-if st.session_state.candidate_set:
-    st.dataframe([{"rank": i+1, "similarity": round(c["similarity"], 4), "text": c["entry"].text[:100]} for i, c in enumerate(st.session_state.candidate_set)])
-
-
-def normalize_rows(x: np.ndarray) -> np.ndarray:
-    norms = np.linalg.norm(x, axis=1, keepdims=True) + 1e-12
-    return x / norms
-
-
-def embed_texts(texts: List[str], model: SentenceTransformer) -> np.ndarray:
-    embs = model.encode(texts, convert_to_numpy=True, show_progress_bar=False)
-    embs = embs.astype(np.float32)
-    embs = normalize_rows(embs)
-    return embs
-
-
-def build_faiss_index(bank: List[ArgumentEntry], model: SentenceTransformer) -> Tuple[faiss.IndexFlatIP, np.ndarray]:
-    texts = [entry.text for entry in bank]
-    if len(texts) == 0:
-        index = faiss.IndexFlatIP(EMBED_DIM)
-        return index, np.zeros((0, EMBED_DIM), dtype=np.float32)
-
-    embs = embed_texts(texts, model)
-    index = faiss.IndexFlatIP(embs.shape[1])
-    index.add(embs)
-    return index, embs
-
-
-def retrieve_candidates(
-    query_text: str,
-    bank: List[ArgumentEntry],
-    index: faiss.IndexFlatIP,
-    model: SentenceTransformer,
-    top_k: int = TOP_K_RETRIEVAL,
-) -> List[Dict[str, Any]]:
-    if len(bank) == 0 or index.ntotal == 0:
-        return []
-
-    q = embed_texts([query_text], model)
-    sims, idxs = index.search(q, min(top_k, len(bank)))
-    sims = sims[0]
-    idxs = idxs[0]
-
-    out = []
-    for sim, idx in zip(sims, idxs):
-        if idx < 0: continue
-        entry = bank[int(idx)]
-        out.append({
-            "bank_idx": int(idx),
-            "similarity": float(sim),
-            "entry": entry,
-        })
-    return out
-
-
-# ------------------------------------------------------------
-# POLICY NETWORK (REINFORCE-STYLE)
-# ------------------------------------------------------------
-
-class RetrievalPolicy(nn.Module):
-    def __init__(self, input_dim: int = 4, hidden_dim: int = POLICY_HIDDEN_DIM):
-        super().__init__()
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc3 = nn.Linear(hidden_dim, 1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = torch.relu(self.fc1(x))
-        x = torch.relu(self.fc2(x))
-        scores = self.fc3(x).squeeze(-1)  
-        return scores
-
-
-class RetrievalAgent:
-    def __init__(self, learning_rate: float = LEARNING_RATE, gamma: float = GAMMA):
-        self.policy = RetrievalPolicy()
-        self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
-        self.gamma = gamma
-        self.log_probs: List[torch.Tensor] = []
-        self.rewards: List[float] = []
-
-    def candidate_features(self, candidates: List[Dict[str, Any]]) -> np.ndarray:
-        feats = []
-        for c in candidates:
-            entry = c["entry"]
-            similarity = c["similarity"]
-            avg_reward = entry.avg_reward
-            reward_count_norm = min(entry.reward_count / 10.0, 1.0)
-            inv_iterations_norm = 1.0 / max(entry.iterations_to_convergence, 1)
-            feats.append([
-                similarity,
-                avg_reward,
-                reward_count_norm,
-                inv_iterations_norm,
-            ])
-        return np.array(feats, dtype=np.float32)
-
-    def choose_candidate(self, candidates: List[Dict[str, Any]]) -> Tuple[int, np.ndarray]:
-        feats = self.candidate_features(candidates)
-        feats_tensor = torch.FloatTensor(feats)
-
-        scores = self.policy(feats_tensor)
-        probs = torch.softmax(scores, dim=0)
-
-        dist = Categorical(probs)
-        action = dist.sample()
-        log_prob = dist.log_prob(action)
-
-        self.log_probs.append(log_prob)
-
-        return int(action.item()), probs.detach().cpu().numpy()
-
-    def record_reward(self, reward: float) -> None:
-        self.rewards.append(float(reward))
-
-    def update_policy(self) -> float:
-        if len(self.rewards) == 0 or len(self.log_probs) == 0:
-            return 0.0
-
-        returns = []
-        R = 0.0
-        for r in reversed(self.rewards):
-            R = r + self.gamma * R
-            returns.insert(0, R)
-
-        returns_tensor = torch.tensor(returns, dtype=torch.float32)
-        if len(returns_tensor) > 1:
-            returns_tensor = (returns_tensor - returns_tensor.mean()) / (returns_tensor.std() + EPS)
-
-        policy_losses = []
-        for log_prob, R in zip(self.log_probs, returns_tensor):
-            policy_losses.append(-log_prob * R)
-
-        self.optimizer.zero_grad()
-        loss = torch.stack(policy_losses).sum()
-        loss.backward()
-        self.optimizer.step()
-
-        loss_value = float(loss.item())
-
-        self.log_probs = []
-        self.rewards = []
-
-        return loss_value
-
-
-# ------------------------------------------------------------
-# REVISION GENERATION
-# ------------------------------------------------------------
-
-def fallback_revision(user_argument: str, exemplar: str, reason: str = "") -> str:
-    reason_clause = ""
-    if reason.strip():
-        reason_clause = f" Also address this criticism from the user: {reason.strip()}"
-
+def _fallback_revision(argument: str, transform: TransformEntry, reason: str = "") -> str:
+    # No LLM available — I surface the transform instructions so the user can
+    # apply them manually. Honest about what's missing.
+    extra = f"\n\nAlso address rejection: {reason.strip()}" if reason.strip() else ""
     return (
-        "Suggested revision:\n\n"
-        f"{user_argument.strip()}\n\n"
-        "Revised toward stronger persuasion:\n"
-        "Narrow the claim, make one mechanism explicit, and replace absolute language with defensible scope. "
-        f"Use this retrieved exemplar as guidance: {exemplar.strip()[:450]}..."
-        f"{reason_clause}"
+        f"[No LLM configured — apply manually]\n\n"
+        f"Transform: {transform.name}\n"
+        f"Instruction: {transform.instruction}\n\n"
+        f"Original:\n{argument}{extra}"
     )
 
+def generate_revision(argument: str, transform: TransformEntry, reason: str = "") -> str:
+    # I try OpenAI first, then Anthropic, then fall back to the manual template.
+    if OPENAI_KEY:
+        try:
+            return _openai_revision(argument, transform, reason)
+        except Exception:
+            pass
+    if ANTHROPIC_KEY:
+        try:
+            return _anthropic_revision(argument, transform, reason)
+        except Exception:
+            pass
+    return _fallback_revision(argument, transform, reason)
 
-def openai_revision(user_argument: str, exemplar: str, reason: str = "") -> str:
-    from openai import OpenAI
-    client = OpenAI(api_key=OPENAI_API_KEY)
-    reason_clause = f"\nThe user previously rejected a revision and said: {reason.strip()}" if reason.strip() else ""
 
-    prompt = f"Original argument:\n{user_argument}\n\nExemplar:\n{exemplar}{reason_clause}\n\nRevise the original argument to be more persuasive."
+# === Transform mutation =====================================
+# When the user rejects a revision with an explanation, I spawn a mutant
+# variant of the transform that failed. The mutation is itself an LLM call:
+# I pass the parent transform plus the failure reason and ask for an improved
+# name, instruction, and trigger. The mutant enters the bank at generation+1
+# with zeroed reward stats — it competes against its parent from scratch.
+# I never delete the parent; both survive and the policy decides which wins.
 
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini", # FIXED: Use a real model name
-        temperature=0.4,
-        messages=[
-            {"role": "system", "content": "You are a rigorous rhetoric assistant."},
-            {"role": "user", "content": prompt},
-        ],
+def _mutate_prompt(parent: TransformEntry, reason: str) -> str:
+    return (
+        f"Failed transform:\n"
+        f"  name: {parent.name}\n"
+        f"  instruction: {parent.instruction}\n"
+        f"  trigger: {parent.trigger}\n\n"
+        f"Failure reason from user: {reason}\n\n"
+        f"Return JSON with improved name, instruction, trigger. "
+        f"The name should make clear it is a variant of '{parent.name}'."
     )
-    return resp.choices[0].message.content.strip()
 
-
-def anthropic_revision(user_argument: str, exemplar: str, reason: str = "") -> str:
-    import anthropic
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    reason_clause = f"\nThe user previously rejected a revision and said: {reason.strip()}" if reason.strip() else ""
-
-    prompt = f"Original argument:\n{user_argument}\n\nExemplar:\n{exemplar}{reason_clause}\n\nRevise the original argument."
-
-    resp = client.messages.create(
-        model="claude-3-5-sonnet-20241022",
-        max_tokens=700,
-        temperature=0.4,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return resp.content[0].text.strip()
-
-
-def generate_revision(user_argument: str, exemplar: str, rejection_reason: str = "") -> str:
-    if OPENAI_API_KEY:
-        try: return openai_revision(user_argument, exemplar, rejection_reason)
-        except Exception as e: return f"{fallback_revision(user_argument, exemplar, rejection_reason)}\n\n[OpenAI fallback: {e}]"
-    if ANTHROPIC_API_KEY:
-        try: return anthropic_revision(user_argument, exemplar, rejection_reason)
-        except Exception as e: return f"{fallback_revision(user_argument, exemplar, rejection_reason)}\n\n[Anthropic fallback: {e}]"
-    return fallback_revision(user_argument, exemplar, rejection_reason)
-
-
-# ------------------------------------------------------------
-# SESSION HELPERS
-# ------------------------------------------------------------
-
-def init_state():
-    # Initialize ALL keys immediately so the UI doesn't crash on first-run
-    defaults = {
-        "startup_error": None,
-        "bank": [],
-        "embedder": None,
-        "faiss_index": None,
-        "bank_embs": None,
-        "agent": RetrievalAgent(),
-        "current_argument": "",
-        "current_topic": "general",
-        "current_iteration": 0,
-        "candidate_set": [],
-        "selected_candidate_local_idx": None,
-        "selected_candidate_probs": None,
-        "latest_revision": "",
-        "latest_rejection_reason": "",
-        "accepted_history": [],
-        "latest_loss": 0.0
+def _parse_mutate_json(raw: str, parent: TransformEntry, reason: str) -> Dict[str, str]:
+    # I strip markdown fences defensively — some models wrap JSON anyway.
+    clean = re.sub(r"```json|```", "", raw).strip()
+    try:
+        data = json.loads(clean)
+    except json.JSONDecodeError:
+        data = {}
+    # Fall back field-by-field so a partial parse still produces a valid entry.
+    return {
+        "name":        data.get("name",        f"{parent.name} (variant)"),
+        "instruction": data.get("instruction", parent.instruction + f"\n\nConstraint from feedback: {reason}"),
+        "trigger":     data.get("trigger",     parent.trigger),
     }
-    
-    for key, val in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = val
 
-    # Now attempt the "heavy" loading
-    if not st.session_state.bank:
+def _openai_mutate(parent: TransformEntry, reason: str) -> Dict[str, str]:
+    from openai import OpenAI
+    r = OpenAI(api_key=OPENAI_KEY).chat.completions.create(
+        model=MUTATE_MODEL_OPENAI,
+        temperature=0.5,  # slightly higher than revision — I want some variation in mutations
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": MUTATE_SYSTEM},
+            {"role": "user",   "content": _mutate_prompt(parent, reason)},
+        ],
+    )
+    return _parse_mutate_json(r.choices[0].message.content, parent, reason)
+
+def _anthropic_mutate(parent: TransformEntry, reason: str) -> Dict[str, str]:
+    import anthropic
+    r = anthropic.Anthropic(api_key=ANTHROPIC_KEY).messages.create(
+        model=MUTATE_MODEL_ANTHROPIC,
+        max_tokens=400,
+        temperature=0.5,
+        system=MUTATE_SYSTEM,
+        messages=[{"role": "user", "content": _mutate_prompt(parent, reason)}],
+    )
+    return _parse_mutate_json(r.content[0].text, parent, reason)
+
+def _fallback_mutate(parent: TransformEntry, reason: str) -> Dict[str, str]:
+    # Without an LLM I can still produce a valid mutation by appending the
+    # user's feedback as an explicit constraint on the instruction.
+    return {
+        "name":        f"{parent.name} (variant)",
+        "instruction": parent.instruction + f"\n\nConstraint from user feedback: {reason}",
+        "trigger":     parent.trigger,
+    }
+
+def spawn_mutation(parent: TransformEntry, reason: str) -> TransformEntry:
+    if OPENAI_KEY:
+        try:
+            fields = _openai_mutate(parent, reason)
+        except Exception:
+            fields = _fallback_mutate(parent, reason)
+    elif ANTHROPIC_KEY:
+        try:
+            fields = _anthropic_mutate(parent, reason)
+        except Exception:
+            fields = _fallback_mutate(parent, reason)
+    else:
+        fields = _fallback_mutate(parent, reason)
+
+    return TransformEntry(
+        id=str(uuid.uuid4()),
+        name=fields["name"],
+        instruction=fields["instruction"],
+        trigger=fields["trigger"],
+        reward_sum=0.0,
+        reward_count=0,
+        avg_reward=0.0,
+        convergence=parent.convergence,  # inherit parent's convergence estimate as prior
+        parent_id=parent.id,
+        generation=parent.generation + 1,
+    )
+
+
+# === Session helpers ========================================
+# Streamlit reruns the whole script on every interaction, so I keep all
+# mutable state in st.session_state. init_state() is idempotent — it only
+# sets keys that don't already exist, so reruns are safe.
+
+def init_state():
+    defaults: Dict[str, Any] = {
+        "startup_error":      None,
+        "bank":               None,   # loaded below
+        "embedder":           None,   # loaded below
+        "faiss_index":        None,   # built below
+        "agent":              Agent(),
+        "argument":           "",
+        "topic":              "general",
+        "iteration":          0,      # how many revisions this session
+        "candidates":         [],     # last retrieved candidate list
+        "selected_idx":       None,   # index into candidates that was chosen
+        "selected_transform": None,   # the TransformEntry that was applied
+        "revision":           "",     # latest LLM output
+        "rejection_reason":   "",     # last rejection text; injected into next prompt
+        "latest_loss":        0.0,    # most recent REINFORCE loss (for display)
+        "last_mutation":      None,   # name of the last spawned mutation (for toast)
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+    if st.session_state.bank is None:
         st.session_state.bank = load_bank(BANK_PATH)
 
     if st.session_state.embedder is None:
         try:
             st.session_state.embedder = get_embedder()
-            idx, embs = build_faiss_index(st.session_state.bank, st.session_state.embedder)
-            st.session_state.faiss_index = idx
-            st.session_state.bank_embs = embs
+            st.session_state.faiss_index = build_index(
+                st.session_state.bank, st.session_state.embedder
+            )
         except Exception as e:
             st.session_state.startup_error = str(e)
-    if "startup_error" not in st.session_state: st.session_state.startup_error = None
-    if "bank" not in st.session_state: st.session_state.bank = load_bank(BANK_PATH)
-    if "embedder" not in st.session_state:
-        try: st.session_state.embedder = get_embedder()
-        except Exception as e:
-            st.session_state.embedder = None
-            st.session_state.startup_error = str(e)
 
-    if "faiss_index" not in st.session_state:
-        if st.session_state.get("embedder") is not None:
-            try:
-                index, embs = build_faiss_index(st.session_state.bank, st.session_state.embedder)
-                st.session_state.faiss_index = index
-                st.session_state.bank_embs = embs
-            except Exception as e:
-                st.session_state.faiss_index = None
-                st.session_state.startup_error = str(e)
-    
-    if "agent" not in st.session_state: st.session_state.agent = RetrievalAgent()
-    if "current_argument" not in st.session_state: st.session_state.current_argument = ""
-    if "current_topic" not in st.session_state: st.session_state.current_topic = "general"
-    if "current_iteration" not in st.session_state: st.session_state.current_iteration = 0
-    if "candidate_set" not in st.session_state: st.session_state.candidate_set = []
-    if "selected_candidate_local_idx" not in st.session_state: st.session_state.selected_candidate_local_idx = None
-    if "selected_candidate_probs" not in st.session_state: st.session_state.selected_candidate_probs = None
-    if "latest_revision" not in st.session_state: st.session_state.latest_revision = ""
-    if "latest_rejection_reason" not in st.session_state: st.session_state.latest_rejection_reason = ""
-    if "accepted_history" not in st.session_state: st.session_state.accepted_history = []
-    if "latest_loss" not in st.session_state: st.session_state.latest_loss = 0.0
+    # I load saved policy weights exactly once per browser session,
+    # guarded by a flag so reruns don't clobber in-progress learning.
+    if "policy_loaded" not in st.session_state:
+        load_policy(st.session_state.agent)
+        st.session_state.policy_loaded = True
 
-def rebuild_index():
-    index, embs = build_faiss_index(st.session_state.bank, st.session_state.embedder)
-    st.session_state.faiss_index = index
-    st.session_state.bank_embs = embs
+def _rebuild():
+    # I call this after every bank mutation. It re-embeds all trigger strings,
+    # rebuilds the FAISS index, and flushes both the bank JSON and the policy
+    # checkpoint to disk so nothing is lost on restart.
+    st.session_state.faiss_index = build_index(
+        st.session_state.bank, st.session_state.embedder
+    )
     save_bank(st.session_state.bank, BANK_PATH)
+    save_policy(st.session_state.agent)
 
-def start_new_session(argument: str, topic: str):
-    st.session_state.current_argument = argument.strip()
-    st.session_state.current_topic = topic.strip() or "general"
-    st.session_state.current_iteration = 0
-    st.session_state.candidate_set = []
-    st.session_state.selected_candidate_local_idx = None
-    st.session_state.selected_candidate_probs = None
-    st.session_state.latest_revision = ""
-    st.session_state.latest_rejection_reason = ""
-    st.session_state.accepted_history = []
-    st.session_state.latest_loss = 0.0
+def reset_session(argument: str, topic: str):
+    # I clear per-argument state but leave the bank, embedder, and agent intact.
+    st.session_state.update(
+        argument=argument.strip(),
+        topic=topic.strip() or "general",
+        iteration=0,
+        candidates=[],
+        selected_idx=None,
+        selected_transform=None,
+        revision="",
+        rejection_reason="",
+        latest_loss=0.0,
+        last_mutation=None,
+    )
 
 def produce_revision():
-    argument = st.session_state.current_argument
-    if not argument.strip(): return
-    st.session_state.current_iteration += 1
-    candidates = retrieve_candidates(argument, st.session_state.bank, st.session_state.faiss_index, st.session_state.embedder)
-    st.session_state.candidate_set = candidates
-    if not candidates:
-        st.session_state.latest_revision = fallback_revision(argument, "", st.session_state.latest_rejection_reason)
+    arg = st.session_state.argument
+    if not arg:
         return
-    idx, probs = st.session_state.agent.choose_candidate(candidates)
-    st.session_state.selected_candidate_local_idx = idx
-    st.session_state.selected_candidate_probs = probs
-    st.session_state.latest_revision = generate_revision(argument, candidates[idx]["entry"].text, st.session_state.latest_rejection_reason)
+    st.session_state.iteration += 1
+    st.session_state.last_mutation = None
+    # I retrieve the top-k transforms whose triggers are most similar to the
+    # argument, then let the policy choose among them stochastically.
+    cands = retrieve(
+        arg, st.session_state.bank,
+        st.session_state.faiss_index, st.session_state.embedder,
+    )
+    st.session_state.candidates = cands
+    if not cands:
+        st.session_state.revision = "[Bank empty]"
+        return
+    idx, _ = st.session_state.agent.choose(cands)
+    st.session_state.selected_idx = idx
+    transform = cands[idx]["entry"]
+    st.session_state.selected_transform = transform
+    st.session_state.revision = generate_revision(
+        arg, transform, st.session_state.rejection_reason
+    )
 
 def apply_feedback(reward: float, reason: str = ""):
-    st.session_state.agent.record_reward(reward)
-    st.session_state.latest_loss = st.session_state.agent.update_policy()
-    idx = st.session_state.selected_candidate_local_idx
-    if idx is not None and st.session_state.candidate_set:
-        entry = st.session_state.bank[st.session_state.candidate_set[idx]["bank_idx"]]
-        entry.reward_sum += reward
-        entry.reward_count += 1
-        entry.avg_reward = entry.reward_sum / max(entry.reward_count, 1)
-    if reason.strip(): st.session_state.latest_rejection_reason = reason.strip()
-    rebuild_index()
+    # I do three things here:
+    #   1. Run a REINFORCE gradient step on the policy network.
+    #   2. Update avg_reward on the selected transform in the bank.
+    #   3. If the feedback is negative and the user gave a reason,
+    #      spawn a mutant variant and add it to the bank.
+    st.session_state.agent.record(reward)
+    st.session_state.latest_loss = st.session_state.agent.update()
 
-def finalize_winner(convinced_reason: str):
-    final_text = st.session_state.latest_revision.strip()
-    if not final_text: return
-    new_entry = ArgumentEntry(str(uuid.uuid4()), final_text, st.session_state.current_topic, 2.0, 1, 2.0, st.session_state.current_iteration, convinced_reason.strip())
-    st.session_state.bank.append(new_entry)
-    st.session_state.accepted_history.append(final_text)
-    rebuild_index()
+    idx = st.session_state.selected_idx
+    if idx is not None and st.session_state.candidates:
+        e = st.session_state.bank[st.session_state.candidates[idx]["bank_idx"]]
+        e.reward_sum  += reward
+        e.reward_count += 1
+        e.avg_reward   = e.reward_sum / e.reward_count
 
-# ------------------------------------------------------------
-# UI
-# ------------------------------------------------------------
+    if reason.strip():
+        st.session_state.rejection_reason = reason.strip()
+
+    if reward < 0 and reason.strip() and st.session_state.selected_transform is not None:
+        mutation = spawn_mutation(st.session_state.selected_transform, reason.strip())
+        st.session_state.bank.append(mutation)
+        st.session_state.last_mutation = mutation.name
+
+    _rebuild()
+
+def finalize(reason: str):
+    # Finalize gives a +2 reward (stronger signal than a plain accept),
+    # then updates the transform's convergence estimate so it knows roughly
+    # how many iterations it typically takes to get accepted.
+    apply_feedback(2.0, reason)
+    t = st.session_state.selected_transform
+    if t and st.session_state.iteration > 0:
+        t.convergence = max(1, (t.convergence + st.session_state.iteration) // 2)
+    _rebuild()
+
+def add_custom_transform(name: str, instruction: str, trigger: str):
+    # Manual additions enter at generation 0 with no parent and zeroed stats —
+    # same starting position as a mutant, same competition rules.
+    st.session_state.bank.append(TransformEntry(
+        id=str(uuid.uuid4()),
+        name=name.strip(),
+        instruction=instruction.strip(),
+        trigger=trigger.strip(),
+    ))
+    _rebuild()
+
+
+# === UI =====================================================
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 init_state()
 
 st.title(APP_TITLE)
-st.caption("Iterative argument optimization with semantic retrieval, FAISS, and REINFORCE-style retrieval updates.")
-if st.session_state.get("startup_error"):
-    st.error("Startup problem: embedding model / FAISS initialization failed.")
-    st.code(st.session_state["startup_error"])
+st.caption("Iterative argument rewriting · transform retrieval · REINFORCE · mutation on rejection")
 
+if st.session_state.startup_error:
+    st.error("Startup error:")
+    st.code(st.session_state.startup_error)
+
+if st.session_state.last_mutation:
+    st.info(f"⚗️ Mutation spawned and added to bank: **{st.session_state.last_mutation}**")
+
+# === Sidebar ================================================
 with st.sidebar:
-    st.header("Settings")
-    st.write(f"Bank size: **{len(st.session_state.bank)}**")
-    
-    # Safe access: if faiss_index is None, show 0 instead of crashing
+    st.header("Bank")
+    st.metric("Transforms", len(st.session_state.bank or []))
     ntotal = st.session_state.faiss_index.ntotal if st.session_state.faiss_index else 0
-    st.write(f"FAISS vectors: **{ntotal}**")
-    
-    st.write(f"Last policy loss: **{st.session_state.latest_loss:.4f}**")
+    st.metric("FAISS vectors", ntotal)
+    st.metric("Last policy loss", f"{st.session_state.latest_loss:.4f}")
 
+    st.divider()
+
+    with st.expander("Add transform"):
+        new_name        = st.text_input("Name",                     key="add_name")
+        new_instruction = st.text_area("Instruction", height=100,   key="add_instruction")
+        new_trigger     = st.text_input("Trigger (when to use this)", key="add_trigger")
+        if st.button("Add") and new_name and new_instruction and new_trigger:
+            add_custom_transform(new_name, new_instruction, new_trigger)
+            st.success(f"Added: {new_name}")
+
+    st.divider()
+
+    if st.button("Reset bank to defaults"):
+        # I wipe both the bank and the policy checkpoint so everything restarts clean.
+        st.session_state.bank = default_bank()
+        st.session_state.agent = Agent()
+        st.session_state.policy_loaded = True  # prevent immediate reload of old checkpoint
+        if os.path.exists(POLICY_PATH):
+            os.remove(POLICY_PATH)
+        _rebuild()
+    st.download_button(
+        "Download bank JSON",
+        json.dumps([e.to_dict() for e in (st.session_state.bank or [])], indent=2),
+        "bank.json",
+    )
+
+# === Main columns ===========================================
 left, right = st.columns([1, 1])
 
 with left:
     st.subheader("Input")
-    topic = st.text_input("Topic", value=st.session_state.current_topic)
-    argument = st.text_area("Argument / Claim", value=st.session_state.current_argument, height=250)
-    c1, c2 = st.columns(2)
+    topic    = st.text_input("Topic",    value=st.session_state.topic)
+    argument = st.text_area("Argument", value=st.session_state.argument, height=280)
+    c1, c2   = st.columns(2)
     with c1:
-        if st.button("Start / Reset Session"): start_new_session(argument, topic)
+        if st.button("Reset session"):
+            reset_session(argument, topic)
     with c2:
-        if st.button("Generate Revision"):
+        if st.button("Generate revision"):
             if argument.strip():
-                if argument.strip() != st.session_state.current_argument: start_new_session(argument, topic)
+                # If the text changed since last session, start fresh.
+                if argument.strip() != st.session_state.argument:
+                    reset_session(argument, topic)
                 produce_revision()
-    st.write(f"Iterations: **{st.session_state.current_iteration}**")
+    st.caption(f"Iteration: {st.session_state.iteration}")
+    if st.session_state.selected_transform:
+        t = st.session_state.selected_transform
+        gen_label = f" · g{t.generation}" if t.generation > 0 else ""
+        st.info(f"**{t.name}**{gen_label}\n\n{t.instruction}")
 
 with right:
-    st.subheader("Revision Output")
-    if st.session_state.latest_revision:
-        st.text_area("Latest Revision", value=st.session_state.latest_revision, height=350)
-        reject_reason = st.text_input("Reason if rejected", value=st.session_state.latest_rejection_reason)
+    st.subheader("Revision")
+    if st.session_state.revision:
+        st.text_area("Output", value=st.session_state.revision, height=280)
+        reason = st.text_input(
+            "Reason (required to trigger mutation on reject)",
+            value=st.session_state.rejection_reason,
+        )
         b1, b2, b3 = st.columns(3)
         with b1:
-            if st.button("👍 Reward"): apply_feedback(1.0, "")
+            if st.button("👍 Accept"):
+                apply_feedback(1.0)
         with b2:
-            if st.button("👎 Penalize"): apply_feedback(-1.0, reject_reason)
+            if st.button("👎 Reject"):
+                # A rejection without a reason still penalises the transform
+                # but does not spawn a mutation — I need the reason to know
+                # what to improve.
+                apply_feedback(-1.0, reason)
         with b3:
             if st.button("✅ Finalize"):
-                apply_feedback(2.0, "")
-                finalize_winner(reject_reason or "Convinced.")
-    else: st.info("No revision yet.")
+                finalize(reason or "Accepted.")
+    else:
+        st.info("No revision yet.")
 
+# === Retrieved candidates ===================================
 st.divider()
-st.subheader("Retrieved Candidates")
-if st.session_state.candidate_set:
-    st.dataframe([{"rank": i+1, "similarity": round(c["similarity"], 4), "text": c["entry"].text[:100]} for i, c in enumerate(st.session_state.candidate_set)])
+st.subheader("Retrieved transforms (this iteration)")
+if st.session_state.candidates:
+    st.dataframe([
+        {
+            "rank":       i + 1,
+            "transform":  c["entry"].name,
+            "gen":        c["entry"].generation,
+            "similarity": round(c["similarity"], 4),
+            "avg_reward": round(c["entry"].avg_reward, 3),
+            "n":          c["entry"].reward_count,
+            "trigger":    c["entry"].trigger[:80],
+        }
+        for i, c in enumerate(st.session_state.candidates)
+    ])
+
+# === Full bank ==============================================
+st.divider()
+bank = st.session_state.bank or []
+with st.expander(f"Full transform bank ({len(bank)} entries)"):
+    if bank:
+        # I sort by generation first so lineages are readable, then by avg_reward
+        # descending so the best transforms within each generation appear first.
+        st.dataframe([
+            {
+                "name":        e.name,
+                "gen":         e.generation,
+                "avg_reward":  round(e.avg_reward, 3),
+                "n":           e.reward_count,
+                "convergence": e.convergence,
+                "parent":      e.parent_id[:8] if e.parent_id else "—",
+                "trigger":     e.trigger[:70],
+            }
+            for e in sorted(bank, key=lambda e: (e.generation, -e.avg_reward))
+        ])
