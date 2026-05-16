@@ -3,7 +3,8 @@ import json
 import uuid
 import re
 from dotenv import load_dotenv
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, field, asdict
+from sklearn.linear_model import LogisticRegression
 from typing import List, Dict, Any, Tuple, Optional
 
 import numpy as np
@@ -37,6 +38,10 @@ HARM_THRESHOLD = 0.8
 # I only return an exemplar if it clears this cosine similarity floor.
 EXEMPLAR_THRESHOLD = 0.75
 MAX_EXEMPLARS      = 2
+
+# Below this many observations, a transform falls back to trigger cosine similarity.
+# Above it, a per-transform logistic regression is used instead.
+MIN_PROJECTION_SAMPLES = 20
 
 OPENAI_KEY    = os.getenv("OPENAI_API_KEY", "")
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
@@ -172,6 +177,11 @@ class TransformEntry:
     convergence: int = 1
     parent_id: str = ""
     generation: int = 0
+    # each entry: {"emb": List[float], "reward": float}
+    # accumulates every (argument embedding, reward) pair seen by this transform.
+    # used to train a per-transform logistic regression that replaces trigger cosine
+    # similarity for retrieval once MIN_PROJECTION_SAMPLES is reached.
+    observations: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -239,7 +249,7 @@ def default_bank() -> List[TransformEntry]:
             instruction=(
                 "Find where the argument relies on an unstated causal or logical link. "
                 "Insert one sentence naming the mechanism connecting the premise to the conclusion. "
-                "Do not add new claims — only make the implicit explicit."
+                "Do not add new claims: only make the implicit explicit."
             ),
             trigger="argument asserts a causal relationship without explaining how or why",
             reward_sum=3.5, reward_count=4, avg_reward=0.875, convergence=2,
@@ -310,7 +320,11 @@ def load_bank(path: str) -> List[TransformEntry]:
         save_bank(bank, path)
         return bank
     with open(path, "r", encoding="utf-8") as f:
-        return [TransformEntry(**item) for item in json.load(f)]
+        entries = []
+        for item in json.load(f):
+            item.setdefault("observations", [])
+            entries.append(TransformEntry(**item))
+        return entries
 
 def save_bank(bank: List[TransformEntry], path: str) -> None:
     with open(path, "w", encoding="utf-8") as f:
@@ -348,15 +362,76 @@ def embed(texts: List[str], model: SentenceTransformer) -> np.ndarray:
     e = model.encode(texts, convert_to_numpy=True, show_progress_bar=False).astype(np.float32)
     return _norm(e)
 
-def build_transform_index(bank: List[TransformEntry], model: SentenceTransformer) -> faiss.IndexFlatIP:
-    # index transform trigger strings so the query (argument text) finds
-    # transforms whose trigger condition semantically matches the argument.
+def get_trigger_embs(bank: List[TransformEntry], model: SentenceTransformer) -> np.ndarray:
+    # Embed every transform's trigger string as a plain numpy array.
+    # Direct dot products against a normalised query give cosine similarity
+    # for the fallback case before a projection is trained.
     if not bank:
-        return faiss.IndexFlatIP(EMBED_DIM)
-    embs = embed([e.trigger for e in bank], model)
-    idx = faiss.IndexFlatIP(embs.shape[1])
-    idx.add(embs)
-    return idx
+        return np.zeros((0, EMBED_DIM), dtype=np.float32)
+    return embed([e.trigger for e in bank], model)
+
+def build_projections(bank: List[TransformEntry]) -> Dict[str, Any]:
+    # For each transform with enough observations, this trains a logistic regression
+    # that maps argument embeddings to P(positive reward). The learned decision
+    # boundary captures the rhetorical subspace where this transform works well,
+    # independent of topical content. Below MIN_PROJECTION_SAMPLES the transform
+    # falls back to trigger cosine similarity.
+    projections: Dict[str, Any] = {}
+    for entry in bank:
+        obs = entry.observations
+        if len(obs) < MIN_PROJECTION_SAMPLES:
+            continue
+        X = np.array([o["emb"] for o in obs], dtype=np.float32)
+        y = np.array([1 if o["reward"] > 0 else 0 for o in obs])
+        if len(np.unique(y)) < 2:
+            continue  # all same label — no discriminative signal yet
+        clf = LogisticRegression(max_iter=500, C=1.0, solver="lbfgs")
+        clf.fit(X, y)
+        projections[entry.id] = clf
+    return projections
+
+def retrieve_transforms(
+    query: str,
+    bank: List[TransformEntry],
+    trigger_embs: np.ndarray,
+    projections: Dict[str, Any],
+    model: SentenceTransformer,
+    k: int = TOP_K,
+) -> List[Dict[str, Any]]:
+    if not bank:
+        return []
+    q = embed([query], model)  # (1, EMBED_DIM), normalised
+
+    # Cosine similarities against all trigger embeddings (for fallback).
+    # Both q and trigger_embs are L2-normalised so dot product == cosine similarity.
+    if len(trigger_embs) > 0:
+        trigger_sims = (trigger_embs @ q.T).flatten()
+    else:
+        trigger_sims = np.zeros(len(bank), dtype=np.float32)
+
+    scored = []
+    for i, entry in enumerate(bank):
+        if entry.id in projections:
+            # Use the learned projection: P(this transform gets positive reward
+            # on an argument with this embedding). Topical dimensions are
+            # de-weighted naturally because they don't predict reward signal.
+            proba    = projections[entry.id].predict_proba(q)[0]
+            classes  = list(projections[entry.id].classes_)
+            pos_idx  = classes.index(1) if 1 in classes else -1
+            score    = float(proba[pos_idx]) if pos_idx >= 0 else 0.5
+            source   = "projection"
+        else:
+            score  = float(trigger_sims[i]) if i < len(trigger_sims) else 0.0
+            source = "trigger"
+        scored.append({
+            "bank_idx":         i,
+            "similarity":       score,
+            "entry":            entry,
+            "retrieval_source": source,
+        })
+
+    scored.sort(key=lambda x: x["similarity"], reverse=True)
+    return scored[:k]
 
 def build_arg_index(store: List[FinalizedArgument], model: SentenceTransformer) -> faiss.IndexFlatIP:
     # index final_text embeddings; the convincing endpoint of each past argument.
@@ -367,22 +442,6 @@ def build_arg_index(store: List[FinalizedArgument], model: SentenceTransformer) 
     idx = faiss.IndexFlatIP(embs.shape[1])
     idx.add(embs)
     return idx
-
-def retrieve_transforms(
-    query: str,
-    bank: List[TransformEntry],
-    index: faiss.IndexFlatIP,
-    model: SentenceTransformer,
-    k: int = TOP_K,
-) -> List[Dict[str, Any]]:
-    if not bank or index.ntotal == 0:
-        return []
-    q = embed([query], model)
-    sims, idxs = index.search(q, min(k, len(bank)))
-    return [
-        {"bank_idx": int(i), "similarity": float(s), "entry": bank[int(i)]}
-        for s, i in zip(sims[0], idxs[0]) if i >= 0
-    ]
 
 def retrieve_exemplars(
     query: str,
@@ -693,7 +752,7 @@ def _fallback_revision(
 ) -> str:
     extra = f"\n\nAlso address rejection: {reason.strip()}" if reason.strip() else ""
     return (
-        f"[No LLM configured — apply manually]\n\n"
+        f"[No LLM configured | Apply manually]\n\n"
         f"Transform: {policy_transform.name}\n"
         f"Instruction: {policy_transform.instruction}\n\n"
         f"Argument:\n{argument}{extra}"
@@ -818,8 +877,9 @@ def init_state():
         "bank":                    None,
         "arg_store":               None,
         "embedder":                None,
-        "faiss_index":             None,  # transform trigger index
-        "arg_index":               None,  # finalized argument index
+        "trigger_embs":            None,   # numpy array of trigger embeddings, one row per bank entry
+        "projections":             {},     # {transform_id: LogisticRegression} rebuilt each _rebuild()
+        "arg_index":               None,   # FAISS index over finalized argument final_text embeddings
         "agent":                   Agent(),
         "stack":                   [],
         "topic":                   "general",
@@ -827,8 +887,9 @@ def init_state():
         "candidates":              [],
         "selected_idx":            None,
         "selected_transform":      None,
-        "exemplars":               [],    # retrieved exemplars for last revision
-        "exemplar_transform":      None,  # best transform from most similar exemplar
+        "current_arg_emb":         None,   # embedding of the argument at the time of revision
+        "exemplars":               [],
+        "exemplar_transform":      None,
         "rejection_reason":        "",
         "latest_loss":             0.0,
         "refusal_message":         None,
@@ -836,8 +897,6 @@ def init_state():
         "context":                 _empty_context(),
         "pending_feedback":        None,
         "feedback_confirmed":      None,
-        # Per-session transform reward tracking, written to FinalizedArgument on finalize.
-        # {transform_id: {id, name, reward_sum, reward_count, avg_reward}}
         "session_transform_rewards": {},
     }
     for k, v in defaults.items():
@@ -852,11 +911,12 @@ def init_state():
 
     if st.session_state.embedder is None:
         try:
-            st.session_state.embedder = get_embedder()
-            st.session_state.faiss_index = build_transform_index(
+            st.session_state.embedder    = get_embedder()
+            st.session_state.trigger_embs = get_trigger_embs(
                 st.session_state.bank, st.session_state.embedder
             )
-            st.session_state.arg_index = build_arg_index(
+            st.session_state.projections = build_projections(st.session_state.bank)
+            st.session_state.arg_index   = build_arg_index(
                 st.session_state.arg_store, st.session_state.embedder
             )
         except Exception as e:
@@ -867,11 +927,13 @@ def init_state():
         st.session_state.policy_loaded = True
 
 def _rebuild():
-    # Rebuilds both FAISS indexes, saves bank + arg store + policy to disk.
-    st.session_state.faiss_index = build_transform_index(
+    # Recomputes trigger embeddings, projections, and arg FAISS index.
+    # Projections are rebuilt from the observations stored on each TransformEntry
+    st.session_state.trigger_embs = get_trigger_embs(
         st.session_state.bank, st.session_state.embedder
     )
-    st.session_state.arg_index = build_arg_index(
+    st.session_state.projections = build_projections(st.session_state.bank)
+    st.session_state.arg_index   = build_arg_index(
         st.session_state.arg_store, st.session_state.embedder
     )
     save_bank(st.session_state.bank, BANK_PATH)
@@ -927,9 +989,9 @@ def produce_revision(argument_text: str):
     if not argument_text.strip():
         return
 
-    st.session_state.refusal_message  = None
+    st.session_state.refusal_message   = None
     st.session_state.feedback_confirmed = None
-    st.session_state.pending_feedback  = None
+    st.session_state.pending_feedback   = None
 
     if not st.session_state.stack or argument_text.strip() != _top_text():
         push_layer(argument_text.strip(), "user")
@@ -943,9 +1005,11 @@ def produce_revision(argument_text: str):
 
     st.session_state.iteration += 1
 
+    # I capture the argument embedding now, before revision, so it can be
+    # recorded as an observation against whichever transform gets applied.
+    st.session_state.current_arg_emb = embed([arg], st.session_state.embedder)[0]
+
     # === Stream 1: exemplar retrieval ===
-    # query the finalized argument index with the current argument text.
-    # Only returns results above EXEMPLAR_THRESHOLD.
     exemplars = retrieve_exemplars(
         arg, st.session_state.arg_store,
         st.session_state.arg_index, st.session_state.embedder,
@@ -959,15 +1023,19 @@ def produce_revision(argument_text: str):
     st.session_state.exemplar_transform = exemplar_transform
 
     # === Stream 2: transform retrieval + policy selection ===
+    # retrieve_transforms scores every transform: using a learned logistic
+    # regression projection where one is trained, trigger cosine similarity otherwise.
     query = _retrieval_query()
     cands = retrieve_transforms(
         query, st.session_state.bank,
-        st.session_state.faiss_index, st.session_state.embedder,
+        st.session_state.trigger_embs,
+        st.session_state.projections,
+        st.session_state.embedder,
     )
     st.session_state.candidates = cands
 
     if not cands:
-        push_layer("[Bank empty — no transforms available]", "llm")
+        push_layer("[Bank empty: No transforms available]", "llm")
         return
 
     idx, _ = st.session_state.agent.choose(cands)
@@ -1001,7 +1069,7 @@ def submit_feedback(feedback_type: str, reason: str):
     st.session_state.agent.record(reward)
     st.session_state.latest_loss = st.session_state.agent.update()
 
-    # Update bank stats and session reward tracking for the selected transform.
+    # Update bank stats, session reward tracking, and projection observations.
     idx = st.session_state.selected_idx
     if idx is not None and st.session_state.candidates:
         e = st.session_state.bank[st.session_state.candidates[idx]["bank_idx"]]
@@ -1009,6 +1077,13 @@ def submit_feedback(feedback_type: str, reason: str):
         e.reward_count += 1
         e.avg_reward    = e.reward_sum / e.reward_count
         _update_session_transform_rewards(e, reward)
+        # Append the argument embedding that was revised to this transform's
+        # observation list. Over time this trains the per-transform projection.
+        if st.session_state.current_arg_emb is not None:
+            e.observations.append({
+                "emb":    st.session_state.current_arg_emb.tolist(),
+                "reward": reward,
+            })
 
     if reason.strip():
         st.session_state.rejection_reason = reason.strip()
@@ -1072,14 +1147,14 @@ init_state()
 st.title(APP_TITLE)
 st.caption(
     "Paste your argument, generate a revision, and rate it. "
-    "Ratings train the selection policy in real time — "
+    "Ratings train the selection policy in real time."
     "upvotes strengthen a transform, downvotes weaken it and spawn an improved variant. "
     "Finalised arguments are saved and inform future revisions on similar topics. "
     "All learning persists across sessions."
 )
 
 if st.session_state.startup_error:
-    st.error("Startup error — embedding model or FAISS failed to initialise:")
+    st.error("Startup error: Embedding model or FAISS failed to initialise:")
     st.code(st.session_state.startup_error)
 
 if st.session_state.refusal_message:
@@ -1091,11 +1166,10 @@ with st.sidebar:
     st.caption(
         "Rhetorical transforms are rewriting strategies the policy has learned to apply. "
         "Each one is selected by a neural network trained on your feedback. "
-        "Transforms are never deleted — they compete based on accumulated reward."
     )
     st.metric("Transforms", len(st.session_state.bank or []))
-    ntotal_t = st.session_state.faiss_index.ntotal if st.session_state.faiss_index else 0
-    st.metric("Transform index size", ntotal_t)
+    n_proj = len(st.session_state.get("projections", {}))
+    st.metric("With learned projections", n_proj)
     ntotal_a = st.session_state.arg_index.ntotal if st.session_state.arg_index else 0
     st.metric("Finalised arguments", ntotal_a)
     st.metric("Policy loss (last update)", f"{st.session_state.latest_loss:.4f}")
@@ -1297,17 +1371,25 @@ with right:
 # === Retrieved transforms ===================================
 st.divider()
 st.subheader("Transforms considered this revision")
-st.caption("The policy scored these candidates and sampled from the distribution. Rank 1 was applied.")
+st.caption(
+    "The policy scored these candidates and sampled from the distribution. Rank 1 was applied. "
+    "'source' shows whether the score came from a learned projection (logistic regression on "
+    "past reward observations) or trigger cosine similarity (fallback until enough data accumulates)."
+)
 if st.session_state.candidates:
+    n_proj = sum(1 for c in st.session_state.candidates if c.get("retrieval_source") == "projection")
+    if n_proj:
+        st.caption(f"{n_proj} of {len(st.session_state.candidates)} candidates scored by learned projection.")
     st.dataframe([
         {
             "rank":       i + 1,
             "transform":  c["entry"].name,
             "generation": c["entry"].generation,
-            "similarity": round(c["similarity"], 4),
+            "score":      round(c["similarity"], 4),
+            "source":     c.get("retrieval_source", "trigger"),
             "avg reward": round(c["entry"].avg_reward, 3),
             "uses":       c["entry"].reward_count,
-            "trigger":    c["entry"].trigger[:80],
+            "obs":        len(c["entry"].observations),
         }
         for i, c in enumerate(st.session_state.candidates)
     ], use_container_width=True)
