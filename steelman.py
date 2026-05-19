@@ -898,6 +898,7 @@ def init_state():
         "pending_feedback":        None,
         "feedback_confirmed":      None,
         "session_transform_rewards": {},
+        "argument_display":        "",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -974,6 +975,7 @@ def reset_session():
         pending_feedback=None,
         feedback_confirmed=None,
         session_transform_rewards={},
+        argument_display="",
     )
 
 def push_layer(text: str, source: str, transform_name: str = ""):
@@ -1260,9 +1262,8 @@ with left:
 
     current_text = st.text_area(
         "Current version",
-        value=_top_text(),
+        value=st.session_state.argument_display or _top_text(),
         height=260,
-        key="main_argument",
         placeholder="Paste or type your argument here...",
         help="This is the version the LLM will revise. Edit freely — changes are saved on Generate.",
     )
@@ -1272,6 +1273,7 @@ with left:
         if st.button("⚡ Generate revision", type="primary", use_container_width=True):
             if current_text.strip():
                 produce_revision(current_text)
+                st.session_state.argument_display = _top_text()
                 st.rerun()
     with col_reset:
         if st.button("↺ New argument", use_container_width=True,
